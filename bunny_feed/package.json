@@ -1,0 +1,19 @@
+{
+  "name": "bunny-feed",
+  "version": "1.0.0",
+  "description": "ATProto Feed on Bunny.net",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --outfile=dist/index.js --format=esm --target=es2022"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.13.0",
+    "@libsql/client": "^0.17.4",
+    "jwt-decode": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

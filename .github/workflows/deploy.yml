@@ -1,0 +1,40 @@
+name: Deploy Bunny Edge Script
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bunny_feed/**'
+      - '.github/workflows/deploy.yml'
+
+env:
+  BUNNY_SCRIPT_NAME: "my-custom-feed" # Change this to match your Bunny.net script name
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: ./bunny_feed
+        run: npm install
+
+      - name: Build Script
+        working-directory: ./bunny_feed
+        run: npm run build
+
+      - name: Deploy to Bunny.net
+        working-directory: ./bunny_feed
+        run: |
+          npx @bunny.net/cli login --api-key ${{ secrets.BUNNY_API_KEY }}
+          npx @bunny.net/cli scripts deploy --script ${{ env.BUNNY_SCRIPT_NAME }} --path dist/index.js
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}

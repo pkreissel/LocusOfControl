@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Environments & caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Archived experiments and one-off scripts
+backup/
+
+# Data, results and model artifacts (regenerable via the pipeline)
+*.jsonl
+*.npz
+*.npy
+!internal_vector.npy
+network_dids.json
+_/
+loc-classifier-*/
+results*/
+results*.json
+*report.json
+vector_errors.json
+*.log
+nohup.out
+
+# Bunny edge worker
+bunny_feed/node_modules/
+bunny_feed/dist/

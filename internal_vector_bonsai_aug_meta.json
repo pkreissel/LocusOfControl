@@ -1,0 +1,8 @@
+{
+  "scale": 14.169471757996174,
+  "bias": -1.000440959973835,
+  "temperature": 5.0,
+  "l2_reg": 0.0001,
+  "embedding_model": "jinaai/jina-embeddings-v5-text-small",
+  "embedding_task": "classification"
+}
