@@ -1,0 +1,12 @@
+atproto
+websockets
+openai
+transformers
+datasets
+torch
+pandas
+scikit-learn
+tqdm
+python-dotenv
+accelerate
+cryptography==48.0.1

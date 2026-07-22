@@ -1,0 +1,30 @@
+{
+  "name": "bunny-feed",
+  "version": "1.0.0",
+  "description": "ATProto Feed on Bunny.net",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --outfile=dist/index.js --format=esm --target=es2022",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push"
+  },
+  "dependencies": {
+    "@atproto/api": "^0.13.0",
+    "@atproto/jwk-jose": "^0.2.4",
+    "@atproto/oauth-client": "^0.7.11",
+    "@atproto/oauth-client-browser": "^0.4.9",
+    "@atproto/oauth-client-node": "^0.4.9",
+    "@bunny.net/edgescript-sdk": "^0.12.1",
+    "@libsql/client": "^0.17.4",
+    "drizzle-orm": "^0.45.2",
+    "jwt-decode": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "dotenv": "^17.4.2",
+    "drizzle-kit": "^0.31.10",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.23.1",
+    "typescript": "^5.5.0"
+  }
+}

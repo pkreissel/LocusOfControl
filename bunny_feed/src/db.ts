@@ -1,0 +1,194 @@
+import { drizzle } from 'drizzle-orm/sqlite-proxy';
+import { embeddingUsage, feedInteractions, postEmbeddings } from './schema';
+import { sql, and, eq, lt, inArray } from 'drizzle-orm';
+
+declare const process: any;
+declare const Bunny: any;
+
+function getEnv(key: string): string | undefined {
+  if (typeof Bunny !== 'undefined' && Bunny.env) return Bunny.env[key];
+  if (typeof process !== 'undefined' && process.env) return process.env[key];
+  return undefined;
+}
+
+// --- Turso HTTP transport -------------------------------------------------
+//
+// We deliberately do NOT use @libsql/client here. On Bunny's edge runtime the
+// libSQL web client pipelines statements through a long-lived `HttpStream` that
+// flushes its `fetch` on a *deferred* queue/microtask. That flush escapes the
+// active request's async context, and Bunny's `fetch` then throws
+// `TypeError: Cannot read properties of undefined (reading 'loop')` because it
+// requires a live request/event-loop binding. Every DB call died this way,
+// which (via the OAuth lock + session restore) silently degraded logged-in
+// users to the unauthenticated public feed.
+//
+// Instead we drive Turso's HTTP pipeline API directly through drizzle's
+// sqlite-proxy driver: a single, inline, fully-awaited `fetch` per query — the
+// same shape as the Jina/bsky calls that already work in-request.
+
+type TursoValue =
+  | { type: 'null' }
+  | { type: 'integer'; value: string }
+  | { type: 'float'; value: number }
+  | { type: 'text'; value: string }
+  | { type: 'blob'; base64: string };
+
+function encodeArg(v: any): TursoValue {
+  if (v === null || v === undefined) return { type: 'null' };
+  switch (typeof v) {
+    case 'bigint': return { type: 'integer', value: v.toString() };
+    case 'number':
+      return Number.isInteger(v)
+        ? { type: 'integer', value: String(v) }
+        : { type: 'float', value: v };
+    case 'boolean': return { type: 'integer', value: v ? '1' : '0' };
+    case 'string': return { type: 'text', value: v };
+    default: return { type: 'text', value: String(v) };
+  }
+}
+
+function decodeValue(cell: any): any {
+  if (!cell) return null;
+  switch (cell.type) {
+    case 'null': return null;
+    case 'integer': return Number(cell.value);
+    case 'float': return cell.value;
+    case 'text': return cell.value;
+    case 'blob': return cell.base64;
+    default: return cell.value ?? null;
+  }
+}
+
+function toHttpUrl(url: string): string {
+  return url
+    .replace(/^libsql:\/\//, 'https://')
+    .replace(/^wss:\/\//, 'https://')
+    .replace(/^ws:\/\//, 'http://');
+}
+
+let _drizzleDb: ReturnType<typeof drizzle> | null = null;
+
+export function getDbClient() {
+  if (_drizzleDb) return _drizzleDb;
+  const rawUrl = getEnv('BUNNY_DATABASE_URL') || getEnv('BUNNY_DB_URL');
+  const authToken = getEnv('BUNNY_DATABASE_AUTH_TOKEN') || getEnv('BUNNY_DB_TOKEN');
+
+  if (!rawUrl || !authToken) {
+    const msg = "Missing BUNNY_DATABASE_URL or BUNNY_DATABASE_AUTH_TOKEN in environment";
+    console.error(`[DB Error]: ${msg}`);
+    throw new Error(msg);
+  }
+
+  const endpoint = `${toHttpUrl(rawUrl).replace(/\/$/, '')}/v2/pipeline`;
+
+  _drizzleDb = drizzle(async (sqlText, params, method) => {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        requests: [
+          { type: 'execute', stmt: { sql: sqlText, args: params.map(encodeArg) } },
+          { type: 'close' },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Turso HTTP ${res.status}: ${body}`);
+    }
+
+    const json: any = await res.json();
+    const first = json?.results?.[0];
+    if (!first || first.type === 'error') {
+      throw new Error(`Turso query failed: ${first?.error?.message ?? 'unknown error'}`);
+    }
+
+    const result = first.response?.result;
+    const rows: any[][] = (result?.rows ?? []).map((row: any[]) => row.map(decodeValue));
+
+    // sqlite-proxy expects a single row array for `get`, array-of-rows otherwise.
+    return { rows: method === 'get' ? rows[0] : rows };
+  });
+
+  return _drizzleDb;
+}
+
+export async function recordEmbeddingUsage(tokens: number) {
+  if (!tokens) return;
+  const db = getDbClient();
+  const day = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  await db.insert(embeddingUsage)
+    .values({
+      day,
+      tokens,
+      requests: 1
+    })
+    .onConflictDoUpdate({
+      target: embeddingUsage.day,
+      set: {
+        tokens: sql`tokens + excluded.tokens`,
+        requests: sql`requests + 1`,
+        updatedAt: sql`CURRENT_TIMESTAMP`
+      }
+    });
+}
+
+// --- Embedding vector cache ----------------------------------------------
+//
+// Read/write per-post vectors in single batched round-trips (one SELECT ... IN
+// for reads, one multi-row upsert for writes) instead of N per-key edge-cache
+// ops. Stored globally in the DB so vectors are shared across all edge PoPs.
+
+// Fetch cached vectors for `uris` produced by `model`. Returns a uri -> vector
+// map containing only the hits; misses are simply absent.
+export async function getCachedEmbeddings(uris: string[], model: string): Promise<Map<string, number[]>> {
+  const out = new Map<string, number[]>();
+  if (uris.length === 0) return out;
+  const db = getDbClient();
+  const rows = await db
+    .select({ uri: postEmbeddings.uri, vec: postEmbeddings.vec })
+    .from(postEmbeddings)
+    .where(and(inArray(postEmbeddings.uri, uris), eq(postEmbeddings.model, model)));
+  for (const r of rows as { uri: string; vec: string }[]) {
+    try { out.set(r.uri, JSON.parse(r.vec)); } catch { /* skip corrupt row */ }
+  }
+  return out;
+}
+
+// Upsert freshly-computed vectors in a single multi-row statement. `entries`
+// must be de-duplicated by uri (SQLite rejects updating the same row twice in
+// one statement).
+export async function putEmbeddings(entries: { uri: string; vec: number[] }[], model: string): Promise<void> {
+  if (entries.length === 0) return;
+  const db = getDbClient();
+  const now = Date.now();
+  await db.insert(postEmbeddings)
+    .values(entries.map(e => ({ uri: e.uri, vec: JSON.stringify(e.vec), model, createdAt: now })))
+    .onConflictDoUpdate({
+      target: postEmbeddings.uri,
+      set: { vec: sql`excluded.vec`, model: sql`excluded.model`, createdAt: sql`excluded.created_at` },
+    });
+}
+
+// Delete cached vectors older than `cutoffTs` (unix ms). Called opportunistically
+// to keep the table bounded.
+export async function pruneOldEmbeddings(cutoffTs: number): Promise<void> {
+  const db = getDbClient();
+  await db.delete(postEmbeddings).where(lt(postEmbeddings.createdAt, cutoffTs));
+}
+
+export async function recordInteraction(did: string | null, item: string, event: string, feedContext?: string) {
+  const db = getDbClient();
+  await db.insert(feedInteractions)
+    .values({
+      id: crypto.randomUUID(),
+      did,
+      item,
+      event,
+      feedContext: feedContext || null
+    });
+}

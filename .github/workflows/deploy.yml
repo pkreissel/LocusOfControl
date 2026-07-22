@@ -1,0 +1,49 @@
+name: Deploy Bunny Edge Script
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bunny_feed/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        working-directory: ./bunny_feed
+        run: npm install
+
+      - name: Push Database Schema
+        working-directory: ./bunny_feed
+        env:
+          BUNNY_DATABASE_URL: ${{ secrets.BUNNY_DATABASE_URL }}
+          BUNNY_DATABASE_AUTH_TOKEN: ${{ secrets.BUNNY_DATABASE_AUTH_TOKEN }}
+        run: npm run db:push -- --force
+
+      - name: Build Script
+        working-directory: ./bunny_feed
+        run: npm run build
+
+      - name: Deploy Script to Bunny Edge Scripting
+        uses: BunnyWay/actions/deploy-script@main
+        with:
+          script_id: ${{ secrets.BUNNY_SCRIPT_ID }}
+          file: "bunny_feed/dist/index.js"
+        env:
+          BUNNY_API_KEY: ${{ secrets.BUNNY_API_KEY }}
