@@ -263,6 +263,13 @@ async function handleRequest(request: Request): Promise<Response> {
       const rkey = feedUriParam.split('/').pop() || 'unknown';
       const isSelbstwirksamkeit = rkey === 'selbstwirksamkeit';
 
+      const unauthPostUri = getEnv('UNAUTHENTICATED_POST_URI');
+      if (!userDid && unauthPostUri && !isSelbstwirksamkeit) {
+        return new Response(JSON.stringify({ feed: [{ post: unauthPostUri }] }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
       if (isSelbstwirksamkeit) {
         userDid = null; // force unauthenticated path
       }
