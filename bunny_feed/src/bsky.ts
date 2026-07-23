@@ -15,7 +15,7 @@ function getEnv(key: string): string | undefined {
 // Discover ("what's hot") feed, overridable via the CANDIDATE_FEED_URI env var.
 const CANDIDATE_FEED_URI =
   getEnv('CANDIDATE_FEED_URI') ||
-  'at://did:plc:ooensn4mr5mhznzypvxelfa3/app.bsky.feed.generator/fu';
+  'at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.generator/with-friends';
 
 // A stream/transport error talking to the user's PDS (e.g. eurosky.social
 // intermittently RST-ing an HTTP/2 stream) is often transient — one retry on a
