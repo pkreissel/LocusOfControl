@@ -200,7 +200,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
   if (url.pathname === '/.well-known/oauth-protected-resource') {
     return new Response(JSON.stringify({
-      resource: url.origin,
+      resource: getPublicBaseUrl(url),
       authorization_servers: ["https://bsky.social"] // Simplified for now
     }), { headers: { 'Content-Type': 'application/json' } });
   }
@@ -466,14 +466,16 @@ async function handleRequest(request: Request): Promise<Response> {
   }
 
   if (url.pathname === '/.well-known/did.json') {
+    const publicBaseUrl = getPublicBaseUrl(url);
+    const publicHostname = new URL(publicBaseUrl).hostname;
     return new Response(JSON.stringify({
       "@context": ["https://www.w3.org/ns/did/v1"],
-      "id": `did:web:${url.hostname}`,
+      "id": `did:web:${publicHostname}`,
       "service": [
         {
           "id": "#bsky_fg",
           "type": "BskyFeedGenerator",
-          "serviceEndpoint": `https://${url.hostname}`
+          "serviceEndpoint": publicBaseUrl
         }
       ]
     }), { headers: { 'Content-Type': 'application/json' } });
