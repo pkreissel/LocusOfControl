@@ -459,6 +459,7 @@ async function handleRequest(request: Request): Promise<Response> {
       const body = await request.json();
       if (body.interactions && Array.isArray(body.interactions)) {
         for (const interaction of body.interactions) {
+          if (interaction.event === 'app.bsky.feed.defs#interactionSeen') continue;
           await recordInteraction(userDid, interaction.item, interaction.event, interaction.feedContext).catch((e: any) => {
             console.error("[sendInteractions] failed to record interaction:", e?.cause?.message || e?.message);
           });

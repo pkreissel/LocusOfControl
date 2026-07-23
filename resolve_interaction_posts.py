@@ -79,9 +79,10 @@ def main():
         for uri, label in uri_to_label.items():
             text = fetched_posts.get(uri)
             if text is not None:
-                # Synthesize highly confident logprobs
-                # e.g., if label == 'internal', internal gets 0.0, others get -10.0
-                raw_logprobs = {"internal": -10.0, "external": -10.0, "neutral": -10.0}
+                # Synthesize somewhat confident logprobs (relaxed from strict 0/-10)
+                # Using -2.5 gives a softmax probability of roughly ~0.85 - 0.90
+                # depending on the temperature, rather than a rigid 0.9999.
+                raw_logprobs = {"internal": -2.5, "external": -2.5, "neutral": -2.5}
                 if label in raw_logprobs:
                     raw_logprobs[label] = 0.0
                     

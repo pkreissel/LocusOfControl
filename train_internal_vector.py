@@ -199,11 +199,14 @@ def main():
     # Load Interactions
     int_rows = load_interaction_rows()
     if int_rows:
-        if not os.path.exists(CACHE_INTERACTIONS_EMBS):
+        if os.path.exists(CACHE_INTERACTIONS_EMBS):
+            int_data = np.load(CACHE_INTERACTIONS_EMBS, allow_pickle=True)
+            X_int = int_data["X"]
+        if not os.path.exists(CACHE_INTERACTIONS_EMBS) or len(int_rows) != len(X_int):
+            print(f"Interaction embeddings cache invalid or missing. Computing {len(int_rows)} embeddings...")
             X_int = compute_embeddings([r["text"] for r in int_rows])
             np.savez_compressed(CACHE_INTERACTIONS_EMBS, X=X_int)
-        int_data = np.load(CACHE_INTERACTIONS_EMBS, allow_pickle=True)
-        X_int = int_data["X"]
+            
         X_int = np.nan_to_num(X_int)
         X_int /= np.linalg.norm(X_int, axis=1, keepdims=True)
         assert len(int_rows) == len(X_int), "Interaction embeddings row count mismatch"
