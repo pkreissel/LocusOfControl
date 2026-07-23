@@ -37,7 +37,7 @@ function getEnv(key: string): string | undefined {
 // PUBLIC_BASE_URL if the deployment ever moves. The request origin is no longer
 // used as a fallback: it varies by isolate warm-up and is what caused the
 // client_id mismatch in the first place.
-const DEFAULT_PUBLIC_BASE_URL = 'https://audacitytohope-bji54.b-cdn.net';
+const DEFAULT_PUBLIC_BASE_URL = 'https://feedforward.b-cdn.net';
 function getPublicBaseUrl(_requestUrl: URL): string {
   const configured = getEnv('PUBLIC_BASE_URL');
   if (configured) return configured.replace(/\/+$/, '');

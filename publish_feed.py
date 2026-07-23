@@ -21,7 +21,7 @@ def main():
     # Must be the PullZone hostname (not the *.bunny.run runtime domain), so
     # requests reach the worker through the PullZone and the Edge Cache API
     # accepts request.url.origin as a valid cache-key domain.
-    hostname = "audacitytohope-bji54.b-cdn.net"
+    hostname = "feedforward.b-cdn.net"
     did_web = f"did:web:{hostname}"
     
     rkey = 'feed-forward'
