@@ -11,6 +11,9 @@ on:
 jobs:
   security-audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -40,4 +43,5 @@ jobs:
         run: pip install pip-audit
 
       - name: Audit Python Packages
+        working-directory: ./backend
         run: pip-audit -r requirements.txt
