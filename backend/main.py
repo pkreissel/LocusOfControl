@@ -3,6 +3,7 @@ import json
 import os
 import time
 import traceback
+import csv
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,7 +41,7 @@ except Exception as e:
     vector_scorer = None
 
 CLASSIFIER_THRESHOLD = 0.15
-VECTOR_PROB_THRESHOLD = float(os.environ.get("VECTOR_PROB_THRESHOLD", "0.15"))
+VECTOR_PROB_THRESHOLD = float(os.environ.get("VECTOR_PROB_THRESHOLD", "0.25"))
 
 @app.get("/api/posts")
 async def get_posts(method: str = "classifier"):
@@ -79,14 +80,14 @@ async def get_posts(method: str = "classifier"):
             client.login(handle, password)
             print("Login successful!")
             
-            feed_uri = "at://did:plc:wrmpulygwvuhjn2c3jbalgqj/app.bsky.feed.generator/your-feed"
+            feed_uri = "at://did:plc:z72i7hdynmk6r22z27h6tvur/app.bsky.feed.generator/with-friends"
             
             posts_processed = 0
             cursor = None
             
-            while posts_processed < 50:
+            while posts_processed < 100:
                 print(f"Fetching discover batch. Cursor: {cursor}")
-                response = client.app.bsky.feed.get_feed({'feed': feed_uri, 'limit': 50, 'cursor': cursor})
+                response = client.app.bsky.feed.get_feed({'feed': feed_uri, 'limit': 100, 'cursor': cursor})
                 if not response.feed:
                     print("No feed items returned. Breaking.")
                     break
@@ -103,6 +104,9 @@ async def get_posts(method: str = "classifier"):
                         
                         batch.append({
                             "did": item.post.author.did,
+                            "handle": getattr(item.post.author, 'handle', None),
+                            "displayName": getattr(item.post.author, 'display_name', None),
+                            "avatar": getattr(item.post.author, 'avatar', None),
                             "uri": item.post.uri,
                             "text": item.post.record.text,
                             "createdAt": getattr(item.post.record, 'created_at', ''),
@@ -152,10 +156,39 @@ async def get_posts(method: str = "classifier"):
                     if should_yield:
                         yield f"data: {json.dumps(post_data)}\n\n"
                         
+                        file_exists = os.path.isfile("disagreements_log.csv")
+                        with open("disagreements_log.csv", "a", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            if not file_exists:
+                                writer.writerow(["uri", "text", "nli_internal", "vector_internal", "disagreement_type"])
+                            
+                            n_int = post_data.get('internalScore', 0)
+                            v_int = post_data.get('vectorInternalScore', 0)
+                            
+                            n_catch = n_int >= CLASSIFIER_THRESHOLD
+                            v_catch = v_int >= VECTOR_PROB_THRESHOLD
+                            
+                            if n_catch and not v_catch:
+                                dtype = "Vector_Miss"
+                            elif not n_catch and v_catch:
+                                dtype = "NLI_Miss"
+                            elif n_catch and v_catch:
+                                dtype = "Both_Agree"
+                            else:
+                                dtype = "None"
+                                
+                            writer.writerow([
+                                post_data.get('uri', ''),
+                                post_data.get('text', '').replace('\n', ' '),
+                                round(n_int, 4),
+                                round(v_int, 4),
+                                dtype
+                            ])
+                        
                 # Small sleep to yield to event loop and not hit rate limits too hard
                 await asyncio.sleep(0.5)
                 
-                if posts_processed >= 50:
+                if posts_processed >= 100:
                     break
                     
             yield "event: end\ndata: {}\n\n"
