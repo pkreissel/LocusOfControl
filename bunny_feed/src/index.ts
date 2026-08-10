@@ -12,7 +12,7 @@ console.log("Bunny Edge Script module initialized");
 
 // Calibrated on the live Discover feed (447-post sample): p>=0.35 passes ~25%
 // of candidates. The old 0.15 passed ~96%, effectively no filtering.
-const VECTOR_PROB_THRESHOLD = 0.35;
+const VECTOR_PROB_THRESHOLD = 0.25;
 declare const process: any;
 declare const Bunny: any;
 

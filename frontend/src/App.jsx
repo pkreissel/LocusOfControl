@@ -5,6 +5,7 @@ import './index.css'
 // The vector method only scores "internal", so it ignores sortMode.
 function getScore(post, method, sortMode) {
   if (method === 'vector') return post.vectorInternalScore
+  if (method === 'disagreement') return Math.abs((post.internalScore || 0) - (post.vectorInternalScore || 0))
   return sortMode === 'internal' ? post.internalScore : post.externalScore
 }
 
@@ -31,12 +32,25 @@ function PostCard({ post, sortMode, method }) {
   return (
     <div className="post-card">
       <div className="post-header">
-        <div className="did-badge">
-          👤 {shortDid}
+        <div className="did-badge" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {post.avatar ? (
+            <img src={post.avatar} alt="avatar" style={{ width: '24px', height: '24px', borderRadius: '50%', objectFit: 'cover' }} />
+          ) : (
+            <span>👤</span>
+          )}
+          <span style={{ fontWeight: 'bold' }}>{post.displayName || post.handle || shortDid}</span>
         </div>
-        <div className={`score-badge ${!isInternal ? 'external-badge' : ''}`}>
-          {badgeEmoji} {badgeLabel}: {((scoreToDisplay || 0) * 100).toFixed(1)}%
-        </div>
+        
+        {method === 'disagreement' ? (
+          <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <div className="score-badge">🧠 {((post.internalScore || 0) * 100).toFixed(1)}%</div>
+            <div className="score-badge">🎯 {((post.vectorInternalScore || 0) * 100).toFixed(1)}%</div>
+          </div>
+        ) : (
+          <div className={`score-badge ${!isInternal ? 'external-badge' : ''}`}>
+            {badgeEmoji} {badgeLabel}: {((scoreToDisplay || 0) * 100).toFixed(1)}%
+          </div>
+        )}
       </div>
       
       <div className="post-content">
@@ -159,6 +173,12 @@ function App() {
           >
             🎯 Vector
           </button>
+          <button
+            className={`toggle-btn ${method === 'disagreement' ? 'active' : ''}`}
+            onClick={() => setMethod('disagreement')}
+          >
+            ⚖️ Disagreements
+          </button>
         </div>
 
         <div className="sort-controls" style={{ marginTop: '1rem', display: 'flex', justifyContent: 'center', gap: '1rem' }}>
@@ -202,8 +222,35 @@ function App() {
           </div>
         )}
 
+        {method === 'disagreement' && posts.length > 0 && (() => {
+          const vecMisses = posts.filter(p => (p.internalScore || 0) >= 0.15 && (p.vectorInternalScore || 0) < 0.25).length;
+          const nliMisses = posts.filter(p => (p.internalScore || 0) < 0.15 && (p.vectorInternalScore || 0) >= 0.25).length;
+          const bothAgree = posts.filter(p => (p.internalScore || 0) >= 0.15 && (p.vectorInternalScore || 0) >= 0.25).length;
+          return (
+            <div style={{ background: 'var(--surface-color)', padding: '1rem', borderRadius: '12px', marginBottom: '1.5rem', display: 'flex', justifyContent: 'space-around', textAlign: 'center' }}>
+              <div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#ef4444' }}>{vecMisses}</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Vector Misses<br/>(NLI caught)</div>
+              </div>
+              <div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#10b981' }}>{bothAgree}</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Both Agree</div>
+              </div>
+              <div>
+                <div style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#f59e0b' }}>{nliMisses}</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>NLI Misses<br/>(Vector caught)</div>
+              </div>
+            </div>
+          );
+        })()}
+
         <div className="post-list">
-          {posts.map((post, i) => (
+          {posts.filter(post => {
+            if (method !== 'disagreement') return true;
+            const isClassifierInternal = (post.internalScore || 0) >= 0.15;
+            const isVectorInternal = (post.vectorInternalScore || 0) >= 0.25;
+            return isClassifierInternal !== isVectorInternal;
+          }).map((post, i) => (
             <PostCard key={post.uri || i} post={post} sortMode={sortMode} method={method} />
           ))}
         </div>
