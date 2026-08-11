@@ -2,7 +2,6 @@ import { Agent } from '@atproto/api';
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddings, EMBEDDING_MODEL } from './jina';
 import { scoreEmbedding } from './vector';
-import { fetchCandidatePosts } from './bsky';
 import { recordEmbeddingUsage, recordInteraction, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings } from './db';
 import { OAuthClient } from '@atproto/oauth-client';
 import { LibSqlStateStore, LibSqlSessionStore, WebCryptoRuntimeImplementation, initOAuthTables } from './oauth-store';
@@ -77,7 +76,7 @@ function getOAuthClient(requestUrl: URL) {
   return client;
 }
 
-type Candidate = { uri: string; cid: string; text: string };
+type Candidate = { uri: string; cid?: string; text: string; minilm_l12_embedding?: string; [key: string]: any };
 type SkeletonBody = { feed: { post: string }[]; cursor?: string };
 
 const SKELETON_TTL_SEC = 60;
@@ -250,6 +249,12 @@ async function handleRequest(request: Request): Promise<Response> {
         return new Response(JSON.stringify({ error: "Missing Jina API Key" }), { status: 500 });
       }
 
+      const geApiKey = getEnv('GREEN_EARTH_API_KEY');
+      if (!geApiKey) {
+        console.error("[getFeedSkeleton Error]: Missing GE API Key in environment");
+        return new Response(JSON.stringify({ error: "Missing GE API Key" }), { status: 500 });
+      }
+
       // Extract User DID from ATProto Service JWT
       const authHeader = request.headers.get('Authorization');
       let userDid = null;
@@ -311,92 +316,108 @@ async function handleRequest(request: Request): Promise<Response> {
         });
       }
 
-      // Prefer an authenticated agent so we get the *personalized* candidate
-      // feed (same as the user's own client). Restore the OAuth session saved
-      // during login; fall back to the generic public appview if the user has
-      // never logged in or the session can't be refreshed.
-      let agent: Agent;
-      let personalized = false;
-      let feedPath: string = userDid ? 'personalized' : 'public-no-did';
-      let failReason: string | undefined;
-      let restoreMs: number | undefined;
-      if (userDid) {
-        const tR = Date.now();
-        try {
-          const oauthSession = await getOAuthClient(url).restore(userDid);
-          agent = new Agent(oauthSession);
-          personalized = true;
-          restoreMs = Date.now() - tR;
-        } catch (err: any) {
-          restoreMs = Date.now() - tR;
-          feedPath = 'public-fallback-restore';
-          failReason = err?.message || String(err);
-          console.error("[getFeedSkeleton] OAuth restore failed for", userDid, '-', failReason);
-          console.error(err);
-        }
-      }
-      if (!personalized) {
-        // Public appview allows unauthenticated getFeed for real feeds
-        // (bsky.social returns 401); returns the non-personalized feed.
-        console.log(`[getFeedSkeleton] Using unauthenticated public AppView for user: ${userDid || 'UNKNOWN'}`);
-        agent = new Agent('https://public.api.bsky.app');
-      }
-      // Pagination: the client passes the `cursor` we returned last time, and
-      // we thread it through the upstream getFeed call. Gather several upstream
-      // pages first, then embed all of their posts in a single Jina batch (one
-      // network round-trip) before scoring and filtering.
-      // volume in one fewer upstream round-trip, which also means one fewer
-      // atproto getSession cycle (lock + session read) on the personalized path.
-      const CANDIDATE_PAGES = 3;
-      const PAGE_SIZE = 100;
-      const candidateFeedUriOverride = isSelbstwirksamkeit 
-        ? 'at://did:plc:ituoear7k6qx3smjfoxhufm4/app.bsky.feed.generator/aaanl422clvee'
-        : undefined;
-
-      const gatherCandidates = async (a: Agent) => {
-        const collected: Candidate[] = [];
-        let cur = startCursor;
-        for (let page = 0; page < CANDIDATE_PAGES; page++) {
-          const result = await fetchCandidatePosts(a, PAGE_SIZE, cur, candidateFeedUriOverride);
-          cur = result.cursor;
-          collected.push(...result.candidates);
-          if (!cur) break; // reached the end of the upstream feed
-        }
-        return { collected, cur };
-      };
-
-      // If the personalized (authenticated) fetch fails — e.g. the OAuth token
-      // can't be refreshed — degrade to the public AppView instead of throwing.
-      // A 500 here is surfaced to the user by the app as "feed unavailable",
-      // whereas the public feed still returns real (non-personalized) results.
-      let candidates: Candidate[];
-      let cursor: string | undefined;
+      let candidates: Candidate[] = [];
+      let cursor: string | undefined = undefined; // We don't have cursor pagination yet
       const tG = Date.now();
+      const geHeaders = {
+        'Content-Type': 'application/json',
+        'X-API-Key': geApiKey
+      };
+      
+      const primaryGenerator = userDid ? 'followed_users' : 'popularity';
+      
       try {
-        ({ collected: candidates, cur: cursor } = await gatherCandidates(agent!));
+        const candRes = await fetch('https://api.greenearth.social/candidates/generate', {
+          method: 'POST',
+          headers: geHeaders,
+          body: JSON.stringify({
+            generators: [{ name: primaryGenerator, weight: 1.0 }],
+            infill: 'popularity',
+            user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
+            num_candidates: 1000
+          })
+        });
+        if (!candRes.ok) {
+          throw new Error(`GE Generate failed: ${candRes.status}`);
+        }
+        const candData = await candRes.json();
+        candidates = (candData.candidates || []).map((c: any) => ({
+            ...c,
+            uri: c.at_uri,
+            text: c.content || ''
+        }));
       } catch (err: any) {
-        if (!personalized) throw err; // already on the public path; nothing to fall back to
-        feedPath = 'public-fallback-fetch';
-        failReason = err?.message || String(err);
-        console.error("[getFeedSkeleton] personalized fetch failed, falling back to public AppView:", failReason, err?.stack || err);
-        ({ collected: candidates, cur: cursor } = await gatherCandidates(new Agent('https://public.api.bsky.app')));
+        console.error("[getFeedSkeleton] GE generate fetch failed:", err?.message || String(err));
       }
+      
       const gatherMs = Date.now() - tG;
+      let feed: { post: string }[] = [];
+      let filteredCandidates: Candidate[] = [];
 
-      const feed: { post: string }[] = [];
       if (candidates.length > 0) {
         // (3) Reuse cached vectors; only cache-missed posts are sent to Jina.
         const { embeddings, tokens } = await embedCandidates(candidates, apiKey);
         // Best-effort cost tracking; never let it break the feed response.
-        // Must be awaited: a fire-and-forget fetch runs after the response is
-        // returned, outside the live request context, where Bunny's fetch dies.
         await recordEmbeddingUsage(tokens).catch((e: any) =>
           console.error("[getFeedSkeleton] failed to record token usage:", e?.cause?.message || e?.message));
+        
         for (let i = 0; i < candidates.length; i++) {
           const score = scoreEmbedding(embeddings[i]);
           if (score.probability >= VECTOR_PROB_THRESHOLD) {
-            feed.push({ post: candidates[i].uri });
+            filteredCandidates.push(candidates[i]);
           }
+        }
+        
+        if (filteredCandidates.length > 0) {
+          // (4) Rank via Green Earth
+          try {
+            const rankRes = await fetch('https://api.greenearth.social/rank/predict', {
+              method: 'POST',
+              headers: geHeaders,
+              body: JSON.stringify({
+                candidates: filteredCandidates,
+                models: [{ name: 'perspective', weight: 1.0 }],
+                user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
+              })
+            });
+            if (rankRes.ok) {
+                const rankData = await rankRes.json();
+                if (rankData.rankings && rankData.rankings.length > 0) {
+                    const rankedUris = rankData.rankings.map((r: any) => r.at_uri);
+                    filteredCandidates.sort((a, b) => {
+                        const idxA = rankedUris.indexOf(a.uri);
+                        const idxB = rankedUris.indexOf(b.uri);
+                        return (idxA === -1 ? 9999 : idxA) - (idxB === -1 ? 9999 : idxB);
+                    });
+                }
+            }
+          } catch (e: any) {
+              console.error("[getFeedSkeleton] GE rank failed:", e?.message || String(e));
+          }
+          
+          // (5) Diversify if embeddings are present
+          const hasMinilm = filteredCandidates.some(c => !!c.minilm_l12_embedding);
+          if (hasMinilm) {
+              try {
+                  const divRes = await fetch('https://api.greenearth.social/diversify', {
+                    method: 'POST',
+                    headers: geHeaders,
+                    body: JSON.stringify({ candidates: filteredCandidates })
+                  });
+                  if (divRes.ok) {
+                      const divData = await divRes.json();
+                      if (divData.candidates && divData.candidates.length > 0) {
+                          filteredCandidates = divData.candidates.map((c: any) => ({
+                              ...c, uri: c.at_uri, text: c.content || ''
+                          }));
+                      }
+                  }
+              } catch (e: any) {
+                  console.error("[getFeedSkeleton] GE diversify failed:", e?.message || String(e));
+              }
+          }
+          
+          feed = filteredCandidates.map(c => ({ post: c.uri }));
         }
       }
 
@@ -428,11 +449,9 @@ async function handleRequest(request: Request): Promise<Response> {
 
       logFeed({
         did: didTag, cursor: cursorTag(startCursor), cache: 'miss',
-        path: feedPath, personalized, cached: !servedFallback,
         cand: candidates.length, pass: feed.length,
         nextCursor: cursor ? 'y' : 'n',
-        restoreMs, gatherMs, ms: Date.now() - t0,
-        ...(failReason ? { fail: failReason } : {}),
+        gatherMs, ms: Date.now() - t0,
       });
 
       return new Response(JSON.stringify(body), {
