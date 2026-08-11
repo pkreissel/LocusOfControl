@@ -318,6 +318,9 @@ async function handleRequest(request: Request): Promise<Response> {
 
       let candidates: Candidate[] = [];
       let cursor: string | undefined = undefined; // We don't have cursor pagination yet
+      const personalized = !!userDid;
+      const feedPath = personalized ? 'personalized' : 'public-no-did';
+      
       const tG = Date.now();
       const geHeaders = {
         'Content-Type': 'application/json',

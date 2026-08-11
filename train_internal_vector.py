@@ -154,6 +154,13 @@ def compute_embeddings(texts, batch_size=64):
     import torch
     from transformers import AutoModel
 
+    torch.manual_seed(SEED)
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
     print(f"Computing {len(texts)} embeddings with {EMBEDDING_MODEL}...")
     model = AutoModel.from_pretrained(EMBEDDING_MODEL, trust_remote_code=True).eval()
     out = []

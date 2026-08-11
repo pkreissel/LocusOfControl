@@ -12,6 +12,13 @@ import numpy as np
 import torch
 from transformers import AutoModel
 
+torch.manual_seed(42)
+if hasattr(torch, "use_deterministic_algorithms"):
+    torch.use_deterministic_algorithms(True, warn_only=True)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 
 class VectorScorer:
     def __init__(self, vector_path, meta_path):
