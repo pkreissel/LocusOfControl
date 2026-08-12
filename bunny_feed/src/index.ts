@@ -1,10 +1,7 @@
-import { Agent } from '@atproto/api';
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddings, EMBEDDING_MODEL } from './jina';
 import { scoreEmbedding } from './vector';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings } from './db';
-import { OAuthClient } from '@atproto/oauth-client';
-import { LibSqlStateStore, LibSqlSessionStore, WebCryptoRuntimeImplementation, initOAuthTables } from './oauth-store';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
 console.log("Bunny Edge Script module initialized");
@@ -33,59 +30,16 @@ function getEnv(key: string): string | undefined {
   return undefined;
 }
 
-// The OAuth client_id MUST be the exact, stable URL where client-metadata.json
-// is publicly served, and it MUST be byte-identical at authorization time and
-// at every later refresh — otherwise the PDS rejects the refresh with
-// invalid_grant "Token was not issued to this client" (which then deletes the
-// session). Deriving it from the incoming request origin is unsafe: this Worker
-// is reachable via several origins (custom domain, Bunny *.b-cdn.net, http vs
-// https, www vs apex), and a module-level singleton freezes to whichever origin
-// first warms the isolate. So pin everything to a configured canonical base URL
-// and only fall back to the request origin when unconfigured (local dev).
-// Default to the PullZone hostname the feed is published under (see
-// publish_feed.py) — this is the origin the PDS fetched client-metadata.json
-// from at login, so it must be the client_id at refresh time too. Override via
-// PUBLIC_BASE_URL if the deployment ever moves. The request origin is no longer
-// used as a fallback: it varies by isolate warm-up and is what caused the
-// client_id mismatch in the first place.
+// The canonical public base URL the feed is published under (see
+// publish_feed.py). Used to serve the did:web document's serviceEndpoint, which
+// must match the origin Bluesky reaches the feed generator at. Override via
+// PUBLIC_BASE_URL if the deployment ever moves; the request origin is not used
+// as a fallback since it varies by isolate warm-up.
 const DEFAULT_PUBLIC_BASE_URL = 'https://feedforward.b-cdn.net';
 function getPublicBaseUrl(_requestUrl: URL): string {
   const configured = getEnv('PUBLIC_BASE_URL');
   if (configured) return configured.replace(/\/+$/, '');
   return DEFAULT_PUBLIC_BASE_URL;
-}
-
-// Keyed by resolved base URL so a stable PUBLIC_BASE_URL yields exactly one
-// client regardless of which origin/isolate serves a given request; without it,
-// each origin still gets its own client instead of cross-contaminating.
-const oauthClients = new Map<string, OAuthClient>();
-function getOAuthClient(requestUrl: URL) {
-  const base = getPublicBaseUrl(requestUrl);
-  let client = oauthClients.get(base);
-  if (!client) {
-    client = new OAuthClient({
-      clientMetadata: {
-        client_name: 'Locus of Control Feed',
-        client_id: `${base}/client-metadata.json`,
-        client_uri: base,
-        redirect_uris: [`${base}/oauth/callback`],
-        scope: 'atproto rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app#bsky_appview rpc:app.bsky.feed.getFeedSkeleton?aud=did:web:api.bsky.app#bsky_appview',
-        grant_types: ['authorization_code', 'refresh_token'],
-        response_types: ['code'],
-        token_endpoint_auth_method: 'none',
-        application_type: 'web',
-        dpop_bound_access_tokens: true
-      },
-      responseMode: 'query',
-      stateStore: new LibSqlStateStore(),
-      sessionStore: new LibSqlSessionStore(),
-      runtimeImplementation: new WebCryptoRuntimeImplementation(),
-      handleResolver: 'https://bsky.social'
-    });
-    oauthClients.set(base, client);
-    console.log('[oauth] initialised client for base', base);
-  }
-  return client;
 }
 
 type Candidate = { uri: string; cid?: string; text: string; minilm_l12_embedding?: string; [key: string]: any };
@@ -209,58 +163,6 @@ BunnySDK.net.http.serve(async (request: Request) => {
 
 async function handleRequest(request: Request): Promise<Response> {
   const url = new URL(request.url);
-
-  // Ensure tables are created (idempotent)
-  await initOAuthTables();
-
-  if (url.pathname === '/client-metadata.json') {
-    const client = getOAuthClient(url);
-    return new Response(JSON.stringify(client.clientMetadata), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-
-  if (url.pathname === '/.well-known/oauth-protected-resource') {
-    return new Response(JSON.stringify({
-      resource: getPublicBaseUrl(url),
-      authorization_servers: ["https://bsky.social"] // Simplified for now
-    }), { headers: { 'Content-Type': 'application/json' } });
-  }
-
-  // --- OAUTH / LOGIN ENDPOINT ---
-  if (url.pathname === '/login' && request.method === 'POST') {
-    try {
-      const text = await request.text();
-      const params = new URLSearchParams(text);
-      const handle = params.get('handle') || '';
-      if (!handle) {
-        return new Response("Missing handle", { status: 400 });
-      }
-
-      const client = getOAuthClient(url);
-      const authUrl = await client.authorize(handle, { scope: client.clientMetadata.scope });
-
-      return Response.redirect(authUrl.toString(), 302);
-    } catch (e: any) {
-      console.error("[Login Route Error]", e);
-      return new Response(`<h2>Login Failed</h2><p>${e.message}</p><a href="/">Try again</a>`, { status: 401, headers: { 'Content-Type': 'text/html' } });
-    }
-  }
-
-  if (url.pathname === '/oauth/callback') {
-    try {
-      const client = getOAuthClient(url);
-      const params = new URLSearchParams(url.search);
-      const result = await client.callback(params);
-
-      return new Response(`<h2>Login Successful!</h2><p>Welcome, ${result.session.sub}. Your session is now saved via OAuth.</p>`, {
-        headers: { 'Content-Type': 'text/html' }
-      });
-    } catch (e: any) {
-      console.error("[Callback Route Error]", e);
-      return new Response(`<h2>Callback Failed</h2><p>${e.message}</p>`, { status: 401, headers: { 'Content-Type': 'text/html' } });
-    }
-  }
 
   // --- FEED GENERATOR SKELETON ENDPOINT ---
   if (url.pathname === '/xrpc/app.bsky.feed.getFeedSkeleton') {
@@ -489,7 +391,16 @@ async function handleRequest(request: Request): Promise<Response> {
       });
 
       return new Response(JSON.stringify(body), {
-        headers: { 'Content-Type': 'application/json', 'X-Cache': 'miss' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Cache': 'miss',
+          // Diagnostics (readable off the HTTP response, no logs needed):
+          // X-Feed-Version confirms which build is actually serving traffic;
+          // X-Exclude-Count reports how many seen-post URIs getSeenUris returned
+          // and thus how many were sent to GE as exclude_uris this request.
+          'X-Feed-Version': 'exclusion-probe-1',
+          'X-Exclude-Count': String(excludeUris.length),
+        },
       });
     } catch (e: any) {
       console.error("[getFeedSkeleton] error:", e?.status ?? '', e?.message, e?.stack);
@@ -544,31 +455,6 @@ async function handleRequest(request: Request): Promise<Response> {
         }
       ]
     }), { headers: { 'Content-Type': 'application/json' } });
-  }
-
-  if (url.pathname === '/') {
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Feed Generator Login</title>
-  <style>
-    body { font-family: sans-serif; max-width: 400px; margin: 2rem auto; padding: 1rem; }
-    input, button { display: block; width: 100%; margin-bottom: 1rem; padding: 0.5rem; box-sizing: border-box; }
-    label { display: block; margin-bottom: 0.25rem; font-weight: bold; }
-  </style>
-</head>
-<body>
-  <h2>Feed Generator Login</h2>
-  <form action="/login" method="POST">
-    <label>Bluesky Handle:</label>
-    <input type="text" name="handle" required placeholder="e.g. alice.bsky.social">
-    <button type="submit">Log In with Bluesky</button>
-  </form>
-</body>
-</html>`;
-    return new Response(html, { headers: { 'Content-Type': 'text/html' } });
   }
 
   return new Response("Bunny ATProto Feed Generator", { status: 200 });

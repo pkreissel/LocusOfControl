@@ -19,8 +19,8 @@ function getEnv(key: string): string | undefined {
 // active request's async context, and Bunny's `fetch` then throws
 // `TypeError: Cannot read properties of undefined (reading 'loop')` because it
 // requires a live request/event-loop binding. Every DB call died this way,
-// which (via the OAuth lock + session restore) silently degraded logged-in
-// users to the unauthenticated public feed.
+// which silently degraded the feed (e.g. seen-post exclusion and embedding
+// caching stopped working).
 //
 // Instead we drive Turso's HTTP pipeline API directly through drizzle's
 // sqlite-proxy driver: a single, inline, fully-awaited `fetch` per query — the

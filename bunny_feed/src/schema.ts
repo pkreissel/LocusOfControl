@@ -42,20 +42,3 @@ export const feedInteractions = sqliteTable('feed_interactions', {
   // cheap to maintain even though "shown" rows are now the insert firehose.
   eventCreatedIdx: index('feed_interactions_event_created_at_idx').on(t.event, t.createdAt),
 }));
-
-export const oauthStates = sqliteTable('oauth_states', {
-  key: text('key').primaryKey(),
-  data: text('data').notNull(),
-  updatedAt: text('updated_at').default(sql`CURRENT_TIMESTAMP`),
-});
-
-export const oauthSessions = sqliteTable('oauth_sessions', {
-  key: text('key').primaryKey(),
-  data: text('data').notNull(),
-  updatedAt: text('updated_at').default(sql`CURRENT_TIMESTAMP`),
-});
-
-export const oauthLocks = sqliteTable('oauth_locks', {
-  name: text('name').primaryKey(),
-  expiresAt: integer('expires_at').notNull(),
-});
