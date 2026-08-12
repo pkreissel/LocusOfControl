@@ -346,7 +346,11 @@ async function handleRequest(request: Request): Promise<Response> {
           method: 'POST',
           headers: geHeaders,
           body: JSON.stringify({
-            generators: [{ name: primaryGenerator, weight: 1.0 }],
+            generators: [
+              { name: primaryGenerator, weight: 1.0 },
+              { name: 'network_likes', weight: 1.0 },
+              { name: 'two_tower', weight: 1.0 }
+            ],
             infill: 'popularity',
             user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
             num_candidates: 1000
