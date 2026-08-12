@@ -149,12 +149,16 @@ export async function getCachedEmbeddings(uris: string[], model: string): Promis
   const out = new Map<string, number[]>();
   if (uris.length === 0) return out;
   const db = getDbClient();
-  const rows = await db
-    .select({ uri: postEmbeddings.uri, vec: postEmbeddings.vec })
-    .from(postEmbeddings)
-    .where(and(inArray(postEmbeddings.uri, uris), eq(postEmbeddings.model, model)));
-  for (const r of rows as { uri: string; vec: string }[]) {
-    try { out.set(r.uri, JSON.parse(r.vec)); } catch { /* skip corrupt row */ }
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < uris.length; i += CHUNK_SIZE) {
+    const chunk = uris.slice(i, i + CHUNK_SIZE);
+    const rows = await db
+      .select({ uri: postEmbeddings.uri, vec: postEmbeddings.vec })
+      .from(postEmbeddings)
+      .where(and(inArray(postEmbeddings.uri, chunk), eq(postEmbeddings.model, model)));
+    for (const r of rows as { uri: string; vec: string }[]) {
+      try { out.set(r.uri, JSON.parse(r.vec)); } catch { /* skip corrupt row */ }
+    }
   }
   return out;
 }
@@ -166,12 +170,16 @@ export async function putEmbeddings(entries: { uri: string; vec: number[] }[], m
   if (entries.length === 0) return;
   const db = getDbClient();
   const now = Date.now();
-  await db.insert(postEmbeddings)
-    .values(entries.map(e => ({ uri: e.uri, vec: JSON.stringify(e.vec), model, createdAt: now })))
-    .onConflictDoUpdate({
-      target: postEmbeddings.uri,
-      set: { vec: sql`excluded.vec`, model: sql`excluded.model`, createdAt: sql`excluded.created_at` },
-    });
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
+    const chunk = entries.slice(i, i + CHUNK_SIZE);
+    await db.insert(postEmbeddings)
+      .values(chunk.map(e => ({ uri: e.uri, vec: JSON.stringify(e.vec), model, createdAt: now })))
+      .onConflictDoUpdate({
+        target: postEmbeddings.uri,
+        set: { vec: sql`excluded.vec`, model: sql`excluded.model`, createdAt: sql`excluded.created_at` },
+      });
+  }
 }
 
 // Delete cached vectors older than `cutoffTs` (unix ms). Called opportunistically
