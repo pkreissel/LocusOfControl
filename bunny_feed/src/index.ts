@@ -367,7 +367,7 @@ async function handleRequest(request: Request): Promise<Response> {
       
       const gatherMs = Date.now() - tG;
       let feed: { post: string }[] = [];
-      let filteredCandidates: Candidate[] = [];
+      const filteredCandidates: Candidate[] = [];
 
       if (candidates.length > 0) {
         // (3) Reuse cached vectors; only cache-missed posts are sent to Jina.
@@ -409,29 +409,13 @@ async function handleRequest(request: Request): Promise<Response> {
           } catch (e: any) {
               console.error("[getFeedSkeleton] GE rank failed:", e?.message || String(e));
           }
-          
-          // (5) Diversify if embeddings are present
-          const hasMinilm = filteredCandidates.some(c => !!c.minilm_l12_embedding);
-          if (hasMinilm) {
-              try {
-                  const divRes = await fetch('https://api.greenearth.social/diversify', {
-                    method: 'POST',
-                    headers: geHeaders,
-                    body: JSON.stringify({ candidates: filteredCandidates })
-                  });
-                  if (divRes.ok) {
-                      const divData = await divRes.json();
-                      if (divData.candidates && divData.candidates.length > 0) {
-                          filteredCandidates = divData.candidates.map((c: any) => ({
-                              ...c, uri: c.at_uri, text: c.content || ''
-                          }));
-                      }
-                  }
-              } catch (e: any) {
-                  console.error("[getFeedSkeleton] GE diversify failed:", e?.message || String(e));
-              }
-          }
-          
+
+          // NOTE: the GE /diversify step was removed. It re-sorts candidates by
+          // the generator's popularity `score` and ignores the input order, so
+          // it silently overwrote the rank order above (the reranker had no
+          // visible effect). It also expects minilm embeddings, which this feed
+          // doesn't produce (we embed with Jina), so it couldn't diversify
+          // anyway. Rank order is now the final feed order.
           feed = filteredCandidates.map(c => ({ post: c.uri }));
         }
       }
