@@ -2,7 +2,7 @@ import { Agent } from '@atproto/api';
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddings, EMBEDDING_MODEL } from './jina';
 import { scoreEmbedding } from './vector';
-import { recordEmbeddingUsage, recordInteraction, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings } from './db';
+import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings } from './db';
 import { OAuthClient } from '@atproto/oauth-client';
 import { LibSqlStateStore, LibSqlSessionStore, WebCryptoRuntimeImplementation, initOAuthTables } from './oauth-store';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
@@ -114,6 +114,17 @@ const EMBED_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 // Fraction of feed requests that opportunistically prune stale cache rows,
 // keeping the table bounded without a separate cron.
 const EMBED_PRUNE_PROBABILITY = 0.02;
+
+// Seen-post exclusion. On each personalized cache miss we pull the user's
+// most-recently-shown posts and hand them to candidate generation as
+// `exclude_uris`, so paging/refreshing doesn't repeat posts they've already
+// viewed. Bounded two ways: at most SEEN_EXCLUDE_LIMIT posts, and never older
+// than SEEN_RETENTION_DAYS — we never go back further than the retention window.
+// That same window governs the opportunistic prune of "shown" rows (engaged
+// rows are kept for training), so read scope and stored data stay in lockstep.
+const SEEN_EXCLUDE_LIMIT = 1000;
+const SEEN_RETENTION_DAYS = 7;
+const SEEN_PRUNE_PROBABILITY = 0.02;
 
 // The skeleton cache uses the Bunny Edge Cache API. Caching is only an
 // optimization, so any cache failure degrades to a miss / no-op and never
@@ -340,21 +351,41 @@ async function handleRequest(request: Request): Promise<Response> {
       };
       
       const primaryGenerator = userDid ? 'followed_users' : 'popularity';
-      
+
+      // Exclude posts this user has already been shown so paging/refreshing
+      // doesn't repeat them. Best-effort: a DB failure just means no exclusion
+      // this request. Only meaningful when we know who the user is.
+      let excludeUris: string[] = [];
+      if (userDid) {
+        excludeUris = await getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS)
+          .catch((e: any) => { console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e)); return []; });
+      }
+
+      // Opportunistically age out old "shown" rows so the table stays bounded
+      // without a separate cron (engaged rows are kept for training).
+      if (Math.random() < SEEN_PRUNE_PROBABILITY) {
+        await pruneOldSeenInteractions(SEEN_RETENTION_DAYS)
+          .catch((e: any) => console.error("[getFeedSkeleton] seen prune failed:", errChain(e)));
+      }
+
       try {
+        const genBody: any = {
+          generators: [
+            { name: primaryGenerator, weight: 1.0 },
+            { name: 'network_likes', weight: 1.0 },
+            { name: 'two_tower', weight: 1.0 }
+          ],
+          infill: 'popularity',
+          user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
+          num_candidates: 1000
+        };
+        // Only send the key when non-empty so the unauthenticated path stays
+        // byte-identical to before and we never send an empty array.
+        if (excludeUris.length > 0) genBody.exclude_uris = excludeUris;
         const candRes = await fetch('https://api.greenearth.social/candidates/generate', {
           method: 'POST',
           headers: geHeaders,
-          body: JSON.stringify({
-            generators: [
-              { name: primaryGenerator, weight: 1.0 },
-              { name: 'network_likes', weight: 1.0 },
-              { name: 'two_tower', weight: 1.0 }
-            ],
-            infill: 'popularity',
-            user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
-            num_candidates: 1000
-          })
+          body: JSON.stringify(genBody)
         });
         if (!candRes.ok) {
           throw new Error(`GE Generate failed: ${candRes.status}`);
@@ -480,12 +511,16 @@ async function handleRequest(request: Request): Promise<Response> {
 
       const body = await request.json();
       if (body.interactions && Array.isArray(body.interactions)) {
-        for (const interaction of body.interactions) {
-          if (interaction.event === 'app.bsky.feed.defs#interactionSeen') continue;
-          await recordInteraction(userDid, interaction.item, interaction.event, interaction.feedContext).catch((e: any) => {
-            console.error("[sendInteractions] failed to record interaction:", e?.cause?.message || e?.message);
-          });
-        }
+        // Record every interaction, INCLUDING `interactionSeen`: the "shown"
+        // signal is what powers seen-post exclusion during candidate generation
+        // (getSeenUris). Batched into one multi-row insert so a scroll burst is a
+        // single DB round-trip, not one per post.
+        const toRecord = body.interactions
+          .filter((i: any) => i && i.item && i.event)
+          .map((i: any) => ({ item: i.item, event: i.event, feedContext: i.feedContext }));
+        await recordInteractions(userDid, toRecord).catch((e: any) => {
+          console.error("[sendInteractions] failed to record interactions:", e?.cause?.message || e?.message);
+        });
       }
 
       return new Response(JSON.stringify({}), { headers: { 'Content-Type': 'application/json' } });

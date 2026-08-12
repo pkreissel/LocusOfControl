@@ -1,6 +1,6 @@
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
 import { embeddingUsage, feedInteractions, postEmbeddings } from './schema';
-import { sql, and, eq, lt, inArray } from 'drizzle-orm';
+import { sql, and, eq, lt, gte, inArray, desc, isNotNull } from 'drizzle-orm';
 
 declare const process: any;
 declare const Bunny: any;
@@ -238,4 +238,72 @@ export async function recordInteraction(did: string | null, item: string, event:
       event,
       feedContext: feedContext || null
     });
+}
+
+// Record a batch of interactions in a single multi-row insert. A scroll burst
+// arrives as many `interactionSeen` events at once; inserting them one-await-at-
+// a-time would be one Turso round-trip per shown post. Chunked to stay under
+// SQLite's bound-parameter limit.
+export async function recordInteractions(
+  did: string | null,
+  interactions: { item: string; event: string; feedContext?: string }[],
+): Promise<void> {
+  if (interactions.length === 0) return;
+  const db = getDbClient();
+  const CHUNK_SIZE = 100;
+  for (let i = 0; i < interactions.length; i += CHUNK_SIZE) {
+    const chunk = interactions.slice(i, i + CHUNK_SIZE);
+    await db.insert(feedInteractions).values(
+      chunk.map(it => ({
+        id: crypto.randomUUID(),
+        did,
+        item: it.item,
+        event: it.event,
+        feedContext: it.feedContext || null,
+      })),
+    );
+  }
+}
+
+// Fetch the most recent post URIs this user has been shown (or engaged with),
+// newest first, so candidate generation can exclude them and stop repeating
+// posts across pages/sessions. Bounded two ways: at most `limit` rows, and never
+// older than `withinDays` — we never go back further than the retention window,
+// so a stale engaged row (those are kept indefinitely) can't exclude a post
+// forever. Backed by the (did, created_at) index, so cost is flat as the table
+// grows. created_at is the SQLite CURRENT_TIMESTAMP text format, matching
+// datetime('now', ...).
+export async function getSeenUris(did: string, limit: number, withinDays: number): Promise<string[]> {
+  if (!did) return [];
+  const db = getDbClient();
+  const rows = await db
+    .select({ item: feedInteractions.item })
+    .from(feedInteractions)
+    .where(and(
+      eq(feedInteractions.did, did),
+      isNotNull(feedInteractions.item),
+      gte(feedInteractions.createdAt, sql`datetime('now', ${`-${withinDays} days`})`),
+    ))
+    .orderBy(desc(feedInteractions.createdAt))
+    .limit(limit);
+  const out: string[] = [];
+  for (const r of rows as { item: string | null }[]) if (r.item) out.push(r.item);
+  return out;
+}
+
+// Prune ONLY high-volume `interactionSeen` rows older than the retention window.
+// Engaged rows (likes/reposts/replies/quotes/requestLess) are kept indefinitely:
+// the offline training pipeline (resolve_interaction_posts.py) reads them, and
+// they are rare. Only the "shown" firehose grows unbounded. `created_at` is the
+// SQLite CURRENT_TIMESTAMP text format ('YYYY-MM-DD HH:MM:SS'), so we compare
+// against datetime('now', ...) which produces the identical format.
+const SEEN_EVENT = 'app.bsky.feed.defs#interactionSeen';
+export async function pruneOldSeenInteractions(retentionDays: number): Promise<void> {
+  const db = getDbClient();
+  await db.delete(feedInteractions).where(
+    and(
+      eq(feedInteractions.event, SEEN_EVENT),
+      lt(feedInteractions.createdAt, sql`datetime('now', ${`-${retentionDays} days`})`),
+    ),
+  );
 }
