@@ -395,7 +395,7 @@ async function handleRequest(request: Request): Promise<Response> {
               headers: geHeaders,
               body: JSON.stringify({
                 candidates: filteredCandidates,
-                models: [{ name: 'perspective', weight: 1.0 }],
+                models: [{ name: 'two_tower', weight: 1.0 }],
                 user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
               })
             });
