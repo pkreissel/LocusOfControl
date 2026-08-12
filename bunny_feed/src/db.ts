@@ -66,6 +66,21 @@ function toHttpUrl(url: string): string {
     .replace(/^ws:\/\//, 'http://');
 }
 
+// Turso's edge intermittently returns transient transport failures — most
+// commonly HTTP 421 ("It seems we are strugling to contact your database.
+// Please retry in a few seconds.") during replica handoff, plus the usual 5xx
+// and network drops. These are not query errors; the statement never ran, so a
+// retry is safe (SELECTs and our idempotent upserts alike). A genuine SQL error
+// ("Turso query failed") is NOT retried — retrying won't fix it.
+//
+// Retries are immediate (no setTimeout backoff) on purpose: this driver exists
+// because work that escapes the active request's async context breaks Bunny's
+// `fetch` (see the transport note above), and a timer callback would run outside
+// that context. Immediate re-issue keeps every attempt an inline, in-request
+// awaited fetch — the shape that actually works here.
+const DB_RETRYABLE_STATUS = new Set([421, 429, 500, 502, 503, 504]);
+const DB_MAX_ATTEMPTS = 3;
+
 let _drizzleDb: ReturnType<typeof drizzle> | null = null;
 
 export function getDbClient() {
@@ -82,36 +97,56 @@ export function getDbClient() {
   const endpoint = `${toHttpUrl(rawUrl).replace(/\/$/, '')}/v2/pipeline`;
 
   _drizzleDb = drizzle(async (sqlText, params, method) => {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${authToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        requests: [
-          { type: 'execute', stmt: { sql: sqlText, args: params.map(encodeArg) } },
-          { type: 'close' },
-        ],
-      }),
+    const body = JSON.stringify({
+      requests: [
+        { type: 'execute', stmt: { sql: sqlText, args: params.map(encodeArg) } },
+        { type: 'close' },
+      ],
     });
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`Turso HTTP ${res.status}: ${body}`);
+    let lastErr: any;
+    for (let attempt = 1; attempt <= DB_MAX_ATTEMPTS; attempt++) {
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+            'Content-Type': 'application/json',
+          },
+          body,
+        });
+
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => '');
+          const err: any = new Error(`Turso HTTP ${res.status}: ${errBody}`);
+          err.retryable = DB_RETRYABLE_STATUS.has(res.status);
+          throw err;
+        }
+
+        const json: any = await res.json();
+        const first = json?.results?.[0];
+        if (!first || first.type === 'error') {
+          // A real SQL error — surface it immediately, never retry.
+          throw new Error(`Turso query failed: ${first?.error?.message ?? 'unknown error'}`);
+        }
+
+        const result = first.response?.result;
+        const rows: any[][] = (result?.rows ?? []).map((row: any[]) => row.map(decodeValue));
+
+        // sqlite-proxy expects a single row array for `get`, array-of-rows otherwise.
+        return { rows: method === 'get' ? rows[0] : rows };
+      } catch (e: any) {
+        lastErr = e;
+        // Retry transient transport failures: a flagged-retryable HTTP status,
+        // or a thrown fetch/network error (which has no `retryable` flag). A
+        // "Turso query failed" SQL error is explicitly non-retryable.
+        const isQueryError = typeof e?.message === 'string' && e.message.startsWith('Turso query failed');
+        const transient = !isQueryError && e?.retryable !== false;
+        if (!transient || attempt === DB_MAX_ATTEMPTS) throw e;
+        console.warn(`[DB] transient failure (attempt ${attempt}/${DB_MAX_ATTEMPTS}), retrying:`, e?.message);
+      }
     }
-
-    const json: any = await res.json();
-    const first = json?.results?.[0];
-    if (!first || first.type === 'error') {
-      throw new Error(`Turso query failed: ${first?.error?.message ?? 'unknown error'}`);
-    }
-
-    const result = first.response?.result;
-    const rows: any[][] = (result?.rows ?? []).map((row: any[]) => row.map(decodeValue));
-
-    // sqlite-proxy expects a single row array for `get`, array-of-rows otherwise.
-    return { rows: method === 'get' ? rows[0] : rows };
+    throw lastErr;
   });
 
   return _drizzleDb;
@@ -149,12 +184,11 @@ export async function getCachedEmbeddings(uris: string[], model: string): Promis
   const out = new Map<string, number[]>();
   if (uris.length === 0) return out;
   const db = getDbClient();
-  // Each cached `vec` is ~11.7 KB of JSON text, so a chunk of N hits returns an
-  // ~N*11.7 KB response body. Bunny's edge `fetch`/`res.json()` is far less
-  // tolerant of large bodies than Node, so keep read chunks small (25 -> ~290 KB)
-  // rather than sizing purely to the SQLite parameter limit. Writes send only
-  // the (tiny) vectors we just computed, so they can chunk larger (see below).
-  const CHUNK_SIZE = 25;
+  // Chunk only to stay well under SQLite's bound-parameter limit. Response size
+  // is not a concern (Turso happily returns multi-MB result sets), and transient
+  // failures are handled by the driver's retry, so keep chunks large to minimise
+  // round-trips.
+  const CHUNK_SIZE = 100;
   for (let i = 0; i < uris.length; i += CHUNK_SIZE) {
     const chunk = uris.slice(i, i + CHUNK_SIZE);
     const rows = await db
