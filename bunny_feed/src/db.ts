@@ -149,7 +149,12 @@ export async function getCachedEmbeddings(uris: string[], model: string): Promis
   const out = new Map<string, number[]>();
   if (uris.length === 0) return out;
   const db = getDbClient();
-  const CHUNK_SIZE = 100;
+  // Each cached `vec` is ~11.7 KB of JSON text, so a chunk of N hits returns an
+  // ~N*11.7 KB response body. Bunny's edge `fetch`/`res.json()` is far less
+  // tolerant of large bodies than Node, so keep read chunks small (25 -> ~290 KB)
+  // rather than sizing purely to the SQLite parameter limit. Writes send only
+  // the (tiny) vectors we just computed, so they can chunk larger (see below).
+  const CHUNK_SIZE = 25;
   for (let i = 0; i < uris.length; i += CHUNK_SIZE) {
     const chunk = uris.slice(i, i + CHUNK_SIZE);
     const rows = await db

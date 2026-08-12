@@ -9,6 +9,18 @@ import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
 console.log("Bunny Edge Script module initialized");
 
+// Drizzle wraps every driver failure in a `DrizzleQueryError` whose message is
+// just "Failed query: <sql>" — the real cause (Turso HTTP status/body, or a
+// runtime `fetch` error) is nested in `.cause`. Walk the chain so logs show why
+// a query actually failed instead of the useless wrapper text.
+function errChain(e: any): string {
+  const parts: string[] = [];
+  for (let cur = e, depth = 0; cur && depth < 6; cur = cur.cause, depth++) {
+    parts.push(cur?.message ?? String(cur));
+  }
+  return parts.join(' <- ');
+}
+
 // Calibrated on the live Discover feed (447-post sample): p>=0.35 passes ~25%
 // of candidates. The old 0.15 passed ~96%, effectively no filtering.
 const VECTOR_PROB_THRESHOLD = 0.25;
@@ -132,7 +144,7 @@ async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ em
 
   // Batch-load cached vectors. Best-effort: a DB error just means "all miss".
   const cached = await getCachedEmbeddings(cands.map(c => c.uri), EMBEDDING_MODEL)
-    .catch((e: any) => { console.error("[embed cache] read failed:", e?.message); return new Map<string, number[]>(); });
+    .catch((e: any) => { console.error("[embed cache] read failed:", errChain(e)); return new Map<string, number[]>(); });
 
   // De-duplicate misses by uri: Jina is billed per unique text, and SQLite
   // rejects upserting the same row twice in one statement.
@@ -163,13 +175,13 @@ async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ em
     // One batched upsert of the freshly-computed vectors.
     const toStore = missUris.map((uri, k) => ({ uri, vec: res.embeddings[k] }));
     await putEmbeddings(toStore, EMBEDDING_MODEL)
-      .catch((e: any) => console.error("[embed cache] write failed:", e?.message));
+      .catch((e: any) => console.error("[embed cache] write failed:", errChain(e)));
   }
 
   // Opportunistically keep the table bounded.
   if (Math.random() < EMBED_PRUNE_PROBABILITY) {
     await pruneOldEmbeddings(Date.now() - EMBED_CACHE_MAX_AGE_MS)
-      .catch((e: any) => console.error("[embed cache] prune failed:", e?.message));
+      .catch((e: any) => console.error("[embed cache] prune failed:", errChain(e)));
   }
 
   return { embeddings, tokens };
