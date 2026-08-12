@@ -237,7 +237,16 @@ async function handleRequest(request: Request): Promise<Response> {
           ms: Date.now() - t0,
         });
         return new Response(JSON.stringify(body), {
-          headers: { 'Content-Type': 'application/json', 'X-Cache': 'hit' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Cache': 'hit',
+            // Never let the Bunny PullZone CDN cache the personalized skeleton:
+            // it keys on neither the cursor nor the per-user Authorization/DID, so
+            // one cached copy freezes the feed for everyone. This response is
+            // already served from our own per-(user,cursor) caches.default; the
+            // CDN layer on top must pass through.
+            'Cache-Control': 'no-store',
+          },
         });
       }
 
@@ -394,11 +403,16 @@ async function handleRequest(request: Request): Promise<Response> {
         headers: {
           'Content-Type': 'application/json',
           'X-Cache': 'miss',
+          // Never let the Bunny PullZone CDN cache the personalized skeleton (see
+          // the hit path above): its cache key ignores the cursor and the per-user
+          // Authorization/DID, so a single cached copy freezes the feed and defeats
+          // seen-post exclusion. Our own caches.default already caches per-key.
+          'Cache-Control': 'no-store',
           // Diagnostics (readable off the HTTP response, no logs needed):
           // X-Feed-Version confirms which build is actually serving traffic;
           // X-Exclude-Count reports how many seen-post URIs getSeenUris returned
           // and thus how many were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'exclusion-probe-1',
+          'X-Feed-Version': 'exclusion-probe-2-nostore',
           'X-Exclude-Count': String(excludeUris.length),
         },
       });
