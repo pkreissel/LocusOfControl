@@ -457,5 +457,5 @@ async function handleRequest(request: Request): Promise<Response> {
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 
-  return new Response("Bunny ATProto Feed Generator", { status: 200 });
+  return new Response(`Bunny ATProto Feed Generator - Current time: ${new Date().toISOString()}`, { status: 200 });
 }
