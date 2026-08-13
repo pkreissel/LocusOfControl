@@ -21,6 +21,13 @@ function errChain(e: any): string {
 // Calibrated on the live Discover feed (447-post sample): p>=0.35 passes ~25%
 // of candidates. The old 0.15 passed ~96%, effectively no filtering.
 const VECTOR_PROB_THRESHOLD = 0.25;
+
+// Weight of the Jina vector-similarity signal in GE's reranker, relative to the
+// two_tower model (fixed at 1.0). We stash each surviving candidate's similarity
+// probability in its `score` field and enable GE's `candidate_score` model, so
+// the ranker itself blends "learned relevance" with "semantic similarity" (and
+// handles the scale normalization) instead of us fusing scores at the edge.
+const RANK_SIM_WEIGHT = 1.0;
 declare const process: any;
 declare const Bunny: any;
 
@@ -398,6 +405,10 @@ async function handleRequest(request: Request): Promise<Response> {
         for (let i = 0; i < candidates.length; i++) {
           const score = scoreEmbedding(embeddings[i]);
           if (score.probability >= VECTOR_PROB_THRESHOLD) {
+            // Overwrite the generator's popularity `score` (unused after ranking)
+            // with the vector-similarity probability so GE's `candidate_score`
+            // model can blend it into the final rank order (see RANK_SIM_WEIGHT).
+            candidates[i].score = score.probability;
             filteredCandidates.push(candidates[i]);
           }
         }
@@ -410,7 +421,12 @@ async function handleRequest(request: Request): Promise<Response> {
               headers: geHeaders,
               body: JSON.stringify({
                 candidates: filteredCandidates,
-                models: [{ name: 'two_tower', weight: 1.0 }],
+                models: [
+                  { name: 'two_tower', weight: 1.0 },
+                  // Blend in vector similarity (stashed in each candidate's
+                  // `score` above) so more semantically-similar posts rank higher.
+                  { name: 'candidate_score', weight: RANK_SIM_WEIGHT },
+                ],
                 user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
               })
             });
