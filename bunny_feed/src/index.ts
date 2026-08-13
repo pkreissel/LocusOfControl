@@ -219,7 +219,11 @@ async function handleRequest(request: Request): Promise<Response> {
       const skeletonCacheKeyStr = skeletonCacheUrl.toString();
 
       const cache = caches.default;
-      const cachedSkeleton = await safeCacheMatch(cache, skeletonCacheKeyStr);
+      // Personalized feeds are never cached (see the write path below): every
+      // logged-in request recomputes so seen-post exclusion (interactionSeen)
+      // takes effect immediately instead of lagging behind the cache TTL. Only
+      // the public/unauthenticated feed is served from — and written to — cache.
+      const cachedSkeleton = userDid ? undefined : await safeCacheMatch(cache, skeletonCacheKeyStr);
 
       if (cachedSkeleton && cachedSkeleton.status === 200) {
         const body = await cachedSkeleton.json();
@@ -371,12 +375,12 @@ async function handleRequest(request: Request): Promise<Response> {
       const body: SkeletonBody = { feed };
       if (cursor) body.cursor = cursor;
 
-      // Don't cache a public fallback under a personalized key: doing so pins
-      // the English (unauthenticated) feed for this user for SKELETON_TTL_SEC,
-      // turning a transient upstream blip into a sticky language switch. Skip
-      // the write so the next request re-attempts the personalized path.
-      const servedFallback = !!userDid && !personalized;
-      if (!servedFallback) {
+      // Only cache the public/unauthenticated feed. Personalized (logged-in)
+      // feeds are never cached: caching them lagged interactionSeen exclusion by
+      // up to SKELETON_TTL_SEC (the cached page kept re-serving already-seen
+      // posts). Recomputing every personalized request keeps exclusion immediate;
+      // the public feed still caches since it has no per-user state to stale.
+      if (!userDid) {
         const resToCache = new Response(JSON.stringify(body), {
           headers: {
             'Content-Type': 'application/json',
@@ -412,7 +416,7 @@ async function handleRequest(request: Request): Promise<Response> {
           // X-Feed-Version confirms which build is actually serving traffic;
           // X-Exclude-Count reports how many seen-post URIs getSeenUris returned
           // and thus how many were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'exclusion-probe-2-nostore',
+          'X-Feed-Version': 'exclusion-probe-3-nocache-personalized',
           'X-Exclude-Count': String(excludeUris.length),
         },
       });
