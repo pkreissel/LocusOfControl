@@ -27,7 +27,7 @@ const VECTOR_PROB_THRESHOLD = 0.25;
 // probability in its `score` field and enable GE's `candidate_score` model, so
 // the ranker itself blends "learned relevance" with "semantic similarity" (and
 // handles the scale normalization) instead of us fusing scores at the edge.
-const RANK_SIM_WEIGHT = 1.0;
+const RANK_SIM_WEIGHT = 2.5;
 declare const process: any;
 declare const Bunny: any;
 
