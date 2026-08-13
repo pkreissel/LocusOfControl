@@ -320,14 +320,21 @@ export async function recordInteractions(
   }
 }
 
-// Fetch the most recent post URIs this user has been shown (or engaged with),
-// newest first, so candidate generation can exclude them and stop repeating
-// posts across pages/sessions. Bounded two ways: at most `limit` rows, and never
-// older than `withinDays` — we never go back further than the retention window,
-// so a stale engaged row (those are kept indefinitely) can't exclude a post
-// forever. Backed by the (did, created_at) index, so cost is flat as the table
-// grows. created_at is the SQLite CURRENT_TIMESTAMP text format, matching
-// datetime('now', ...).
+// The interactionSeen event id — the "shown" signal. Both the exclusion read
+// below and the seen-row prune key off this single event, so the read scope
+// (what we exclude) and the write retention (what we keep) stay in lockstep.
+const SEEN_EVENT = 'app.bsky.feed.defs#interactionSeen';
+
+// Fetch the most recent post URIs this user has been *shown*, newest first, so
+// candidate generation can exclude them and stop repeating posts across
+// pages/sessions. Deliberately scoped to `interactionSeen` only: engagement
+// events (likes/reposts/replies/requestMore/Less) must NOT hide a post from the
+// feed — a liked or "more like this" post is not a seen post, and excluding on
+// them would silently bury content the user engaged with. Bounded two ways: at
+// most `limit` rows, and never older than `withinDays` (the same window the
+// seen-row prune uses, so we never look back past retention). Backed by the
+// (did, created_at) index. created_at is the SQLite CURRENT_TIMESTAMP text
+// format, matching datetime('now', ...).
 export async function getSeenUris(did: string, limit: number, withinDays: number): Promise<string[]> {
   if (!did) return [];
   const db = getDbClient();
@@ -336,6 +343,7 @@ export async function getSeenUris(did: string, limit: number, withinDays: number
     .from(feedInteractions)
     .where(and(
       eq(feedInteractions.did, did),
+      eq(feedInteractions.event, SEEN_EVENT),
       isNotNull(feedInteractions.item),
       gte(feedInteractions.createdAt, sql`datetime('now', ${`-${withinDays} days`})`),
     ))
@@ -351,8 +359,8 @@ export async function getSeenUris(did: string, limit: number, withinDays: number
 // the offline training pipeline (resolve_interaction_posts.py) reads them, and
 // they are rare. Only the "shown" firehose grows unbounded. `created_at` is the
 // SQLite CURRENT_TIMESTAMP text format ('YYYY-MM-DD HH:MM:SS'), so we compare
-// against datetime('now', ...) which produces the identical format.
-const SEEN_EVENT = 'app.bsky.feed.defs#interactionSeen';
+// against datetime('now', ...) which produces the identical format. Keys off the
+// shared SEEN_EVENT id (declared above getSeenUris).
 export async function pruneOldSeenInteractions(retentionDays: number): Promise<void> {
   const db = getDbClient();
   await db.delete(feedInteractions).where(
