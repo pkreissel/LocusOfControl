@@ -1,7 +1,7 @@
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddings, EMBEDDING_MODEL } from './jina';
 import { scoreEmbedding } from './vector';
-import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings } from './db';
+import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings, putFeedSession, getFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
 console.log("Bunny Edge Script module initialized");
@@ -79,6 +79,42 @@ const EMBED_PRUNE_PROBABILITY = 0.02;
 const SEEN_EXCLUDE_LIMIT = 1000;
 const SEEN_RETENTION_DAYS = 7;
 const SEEN_PRUNE_PROBABILITY = 0.02;
+
+// Cursor pagination. Page 1 runs the full generate→embed→rank pipeline (exactly
+// as before) and freezes the ranked URI list in a feed_sessions row; later pages
+// slice a window out of that frozen list instead of regenerating. This makes
+// intra-session paging cheap and repeat-free regardless of interactionSeen
+// timing, while seen-exclusion still runs at page 1 for cross-session freshness.
+//
+// Cursor wire format: `${sessionId}.${offset}`. sessionId is a UUID (no dots),
+// so we split on the last dot. SESSION_TTL_MS must exceed the public skeleton
+// cache TTL so a cached public START body keeps pointing at a still-live session.
+const SESSION_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_PAGE_SIZE = 30;
+const MAX_PAGE_SIZE = 100;
+const SESSION_PRUNE_PROBABILITY = 0.02;
+
+function parseLimit(raw: string | null): number {
+  const n = raw ? parseInt(raw, 10) : NaN;
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_PAGE_SIZE;
+  return Math.min(n, MAX_PAGE_SIZE);
+}
+
+function encodeCursor(sessionId: string, offset: number): string {
+  return `${sessionId}.${offset}`;
+}
+
+// Decode `${sessionId}.${offset}`. Returns null for START (no cursor) or any
+// malformed value, so the caller treats it as a fresh page-1 request.
+function decodeCursor(raw: string | undefined): { sessionId: string; offset: number } | null {
+  if (!raw) return null;
+  const dot = raw.lastIndexOf('.');
+  if (dot <= 0 || dot === raw.length - 1) return null;
+  const sessionId = raw.slice(0, dot);
+  const offset = parseInt(raw.slice(dot + 1), 10);
+  if (!Number.isFinite(offset) || offset < 0) return null;
+  return { sessionId, offset };
+}
 
 // The skeleton cache uses the Bunny Edge Cache API. Caching is only an
 // optimization, so any cache failure degrades to a miss / no-op and never
@@ -193,13 +229,6 @@ async function handleRequest(request: Request): Promise<Response> {
       const rkey = feedUriParam.split('/').pop() || 'unknown';
       const isSelbstwirksamkeit = rkey === 'selbstwirksamkeit';
 
-      const unauthPostUri = getEnv('UNAUTHENTICATED_POST_URI');
-      if (!userDid && unauthPostUri && !isSelbstwirksamkeit) {
-        return new Response(JSON.stringify({ feed: [{ post: unauthPostUri }] }), {
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
-
       if (isSelbstwirksamkeit) {
         userDid = null; // force unauthenticated path
       }
@@ -210,7 +239,11 @@ async function handleRequest(request: Request): Promise<Response> {
       // user DID (or "public") + pagination cursor. A hit returns instantly and
       // skips the upstream fetches, embeddings, and the OAuth restore/lock below.
       const startCursor: string | undefined = url.searchParams.get('cursor') || undefined;
-      const cacheKey = `${rkey}:${userDid || 'public'}:${startCursor || 'START'}`;
+      const limit = parseLimit(url.searchParams.get('limit'));
+      // `limit` is part of the key: the cached (public) body is already sliced to
+      // a page size, so a client asking for a different limit must not be served
+      // another's slice.
+      const cacheKey = `${rkey}:${userDid || 'public'}:${startCursor || 'START'}:l${limit}`;
 
       const skeletonCacheUrl = new URL(request.url);
       skeletonCacheUrl.pathname = '/_cache/skeleton';
@@ -254,8 +287,45 @@ async function handleRequest(request: Request): Promise<Response> {
         });
       }
 
+      // (2) Continuation page: the cursor points at a frozen ranked list from an
+      // earlier page-1 request. Read it back and slice the next window — no GE,
+      // embedding, or rank work. On any miss (expired/pruned session, wrong
+      // owner, or a malformed/garbage cursor) we fall through to a fresh
+      // generation below, which re-runs seen-exclusion; by the time a session has
+      // aged out, interactionSeen for its posts has long since landed, so the
+      // regeneration doesn't repeat them.
+      const decoded = decodeCursor(startCursor);
+      if (decoded) {
+        const session = await getFeedSession(decoded.sessionId)
+          .catch((e: any) => { console.error("[getFeedSkeleton] session read failed:", errChain(e)); return null; });
+        const fresh = !!session && (Date.now() - session.createdAt) < SESSION_TTL_MS;
+        const ownerOk = !!session && (session.did || null) === (userDid || null);
+        if (session && fresh && ownerOk) {
+          const page = session.uris.slice(decoded.offset, decoded.offset + limit);
+          const nextOffset = decoded.offset + page.length;
+          const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
+          if (nextOffset < session.uris.length) body.cursor = encodeCursor(decoded.sessionId, nextOffset);
+          logFeed({
+            did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'cont',
+            off: decoded.offset, limit, feedLen: page.length,
+            nextCursor: body.cursor ? 'y' : 'n', ms: Date.now() - t0,
+          });
+          return new Response(JSON.stringify(body), {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Cache': 'miss',
+              'X-Page-Path': 'cont',
+              // Never let the PullZone CDN cache the personalized skeleton (keys on
+              // neither cursor nor DID). Our own per-key stores handle caching.
+              'Cache-Control': 'no-store',
+              'X-Feed-Version': 'pagination-1',
+            },
+          });
+        }
+        // Session gone/stale/foreign → fall through to a fresh page 1.
+      }
+
       let candidates: Candidate[] = [];
-      let cursor: string | undefined = undefined; // We don't have cursor pagination yet
       const personalized = !!userDid;
       const feedPath = personalized ? 'personalized' : 'public-no-did';
       
@@ -316,7 +386,6 @@ async function handleRequest(request: Request): Promise<Response> {
       }
       
       const gatherMs = Date.now() - tG;
-      let feed: { post: string }[] = [];
       const filteredCandidates: Candidate[] = [];
 
       if (candidates.length > 0) {
@@ -366,14 +435,38 @@ async function handleRequest(request: Request): Promise<Response> {
           // visible effect). It also expects minilm embeddings, which this feed
           // doesn't produce (we embed with Jina), so it couldn't diversify
           // anyway. Rank order is now the final feed order.
-          feed = filteredCandidates.map(c => ({ post: c.uri }));
         }
       }
 
-      // Only return a cursor while the upstream feed still has more pages;
-      // omitting it signals "end of feed" to the client.
+      // The full ranked list for this scroll session. Page 1 freezes it in a
+      // feed_sessions row and serves only the first `limit` posts; the cursor
+      // lets later pages slice further into this exact ordering without
+      // regenerating. (Previously the entire list was returned as a single page.)
+      const rankedUris = filteredCandidates.map(c => c.uri);
+      let sessionStored = false;
+      let sessionId = '';
+      if (rankedUris.length > 0) {
+        sessionId = crypto.randomUUID();
+        sessionStored = await putFeedSession(sessionId, userDid, rankedUris);
+      }
+
+      // Opportunistically prune expired sessions so the table stays bounded.
+      if (Math.random() < SESSION_PRUNE_PROBABILITY) {
+        await pruneOldFeedSessions(Date.now() - SESSION_TTL_MS)
+          .catch((e: any) => console.error("[getFeedSkeleton] session prune failed:", errChain(e)));
+      }
+
+      const page = rankedUris.slice(0, limit);
+      const feed: { post: string }[] = page.map(uri => ({ post: uri }));
+
+      // Emit a continuation cursor only when the session was stored AND more
+      // posts remain past this page; omitting it signals "end of feed". A failed
+      // session write yields no cursor — the client gets page 1 and a refresh
+      // regenerates, rather than a cursor that could only miss and regenerate.
       const body: SkeletonBody = { feed };
-      if (cursor) body.cursor = cursor;
+      if (sessionStored && limit < rankedUris.length) {
+        body.cursor = encodeCursor(sessionId, limit);
+      }
 
       // Only cache the public/unauthenticated feed. Personalized (logged-in)
       // feeds are never cached: caching them lagged interactionSeen exclusion by
@@ -390,16 +483,19 @@ async function handleRequest(request: Request): Promise<Response> {
             'X-Personalized': String(personalized),
             'X-Feed-Path': feedPath,
             'X-Cand-Count': String(candidates.length),
-            'X-Pass-Count': String(feed.length),
+            // Total that passed the vector filter (the full frozen list), not the
+            // page length — preserves this marker's meaning now that we page.
+            'X-Pass-Count': String(rankedUris.length),
           }
         });
         await safeCachePut(cache, skeletonCacheKeyStr, resToCache);
       }
 
       logFeed({
-        did: didTag, cursor: cursorTag(startCursor), cache: 'miss',
-        cand: candidates.length, pass: feed.length,
-        nextCursor: cursor ? 'y' : 'n',
+        did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
+        cand: candidates.length, pass: rankedUris.length,
+        off: 0, limit, feedLen: feed.length,
+        nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
       });
 
@@ -407,6 +503,7 @@ async function handleRequest(request: Request): Promise<Response> {
         headers: {
           'Content-Type': 'application/json',
           'X-Cache': 'miss',
+          'X-Page-Path': 'fresh',
           // Never let the Bunny PullZone CDN cache the personalized skeleton (see
           // the hit path above): its cache key ignores the cursor and the per-user
           // Authorization/DID, so a single cached copy freezes the feed and defeats
@@ -414,9 +511,10 @@ async function handleRequest(request: Request): Promise<Response> {
           'Cache-Control': 'no-store',
           // Diagnostics (readable off the HTTP response, no logs needed):
           // X-Feed-Version confirms which build is actually serving traffic;
-          // X-Exclude-Count reports how many seen-post URIs getSeenUris returned
-          // and thus how many were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'exclusion-probe-3-nocache-personalized',
+          // X-Ranked-Count is the full frozen list length; X-Exclude-Count reports
+          // how many seen-post URIs were sent to GE as exclude_uris this request.
+          'X-Feed-Version': 'pagination-1',
+          'X-Ranked-Count': String(rankedUris.length),
           'X-Exclude-Count': String(excludeUris.length),
         },
       });

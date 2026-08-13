@@ -25,6 +25,26 @@ export const postEmbeddings = sqliteTable('post_embeddings', {
   createdIdx: index('post_embeddings_created_at_idx').on(t.createdAt),
 }));
 
+// Frozen ranked list for one scroll session, so cursor pagination pages through
+// a stable ordering instead of re-running the expensive generate→embed→rank
+// pipeline (and re-hitting the seen-exclusion timing race) on every page. Page 1
+// computes the full ranked list, stores it here under an opaque id, and serves a
+// window; later pages just slice `uris`. Stored in Turso (not the per-PoP edge
+// cache) so a continuation request that lands on a different edge location still
+// finds the list — a per-PoP cache would miss and fall back to regeneration,
+// which can repeat the current session's not-yet-`interactionSeen` posts. Pruned
+// opportunistically by `createdAt` (rows live only for a scroll session).
+export const feedSessions = sqliteTable('feed_sessions', {
+  id: text('id').primaryKey(),                 // opaque session id (crypto.randomUUID())
+  did: text('did'),                            // owner DID (null = public); scopes reads + observability
+  uris: text('uris').notNull(),                // JSON array of ranked at-uris (the frozen list)
+  createdAt: integer('created_at').notNull(),  // unix ms, for TTL freshness check + prune
+}, (t) => ({
+  // Serves the opportunistic prune (WHERE created_at < cutoff). created_at is
+  // monotonic, so inserts append to the index edge.
+  createdIdx: index('feed_sessions_created_at_idx').on(t.createdAt),
+}));
+
 export const feedInteractions = sqliteTable('feed_interactions', {
   id: text('id').primaryKey(),
   did: text('did'),

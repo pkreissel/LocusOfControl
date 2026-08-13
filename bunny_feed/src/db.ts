@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
-import { embeddingUsage, feedInteractions, postEmbeddings } from './schema';
+import { embeddingUsage, feedInteractions, feedSessions, postEmbeddings } from './schema';
 import { sql, and, eq, lt, gte, inArray, desc, isNotNull } from 'drizzle-orm';
 
 declare const process: any;
@@ -226,6 +226,61 @@ export async function putEmbeddings(entries: { uri: string; vec: number[] }[], m
 export async function pruneOldEmbeddings(cutoffTs: number): Promise<void> {
   const db = getDbClient();
   await db.delete(postEmbeddings).where(lt(postEmbeddings.createdAt, cutoffTs));
+}
+
+// --- Cursor-pagination session store -------------------------------------
+//
+// A scroll session's frozen ranked URI list. Page 1 stores the full ranked list
+// here; later pages read it back and slice a window, so pagination never re-runs
+// the generate→embed→rank pipeline and can't repeat posts within the session.
+
+// Store the ranked URI list for a session. Returns true only if the write
+// landed, so the caller emits a continuation cursor only when the list is
+// actually retrievable. Best-effort: never throws.
+export async function putFeedSession(id: string, did: string | null, uris: string[]): Promise<boolean> {
+  try {
+    const db = getDbClient();
+    await db.insert(feedSessions).values({
+      id,
+      did,
+      uris: JSON.stringify(uris),
+      createdAt: Date.now(),
+    });
+    return true;
+  } catch (e: any) {
+    console.error("[feed session] write failed:", e?.cause?.message || e?.message);
+    return false;
+  }
+}
+
+// Fetch a session's frozen list. Returns null on miss or parse failure so the
+// caller falls back to a fresh generation.
+export async function getFeedSession(
+  id: string,
+): Promise<{ uris: string[]; did: string | null; createdAt: number } | null> {
+  const db = getDbClient();
+  const rows = await db
+    .select({ uris: feedSessions.uris, did: feedSessions.did, createdAt: feedSessions.createdAt })
+    .from(feedSessions)
+    .where(eq(feedSessions.id, id))
+    .limit(1);
+  const row = (rows as { uris: string; did: string | null; createdAt: number }[])[0];
+  if (!row) return null;
+  try {
+    const uris = JSON.parse(row.uris);
+    if (!Array.isArray(uris)) return null;
+    return { uris, did: row.did, createdAt: row.createdAt };
+  } catch {
+    return null;
+  }
+}
+
+// Delete sessions older than `cutoffTs` (unix ms). Sessions live only for the
+// length of a scroll session, so this keeps the table small; called
+// opportunistically like the other prunes.
+export async function pruneOldFeedSessions(cutoffTs: number): Promise<void> {
+  const db = getDbClient();
+  await db.delete(feedSessions).where(lt(feedSessions.createdAt, cutoffTs));
 }
 
 export async function recordInteraction(did: string | null, item: string, event: string, feedContext?: string) {
