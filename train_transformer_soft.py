@@ -43,11 +43,24 @@ def soft_target(raw_logprobs, T):
     return (e / e.sum()).tolist()
 
 
+FOCAL_GAMMA = float(os.environ.get("LOC_FOCAL_GAMMA", "2.0"))
+FOCAL_ALPHA_INTERNAL = float(os.environ.get("LOC_FOCAL_ALPHA_INTERNAL", "2.0"))
+
 class SoftTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        loss = F.cross_entropy(outputs.logits, labels)  # labels are prob vectors
+        
+        logits = outputs.logits
+        p = torch.softmax(logits, dim=-1)
+        log_p = torch.log_softmax(logits, dim=-1)
+        
+        # Alpha weighting for class imbalance: Internal (0), External (1), Neutral (2)
+        alpha = torch.tensor([FOCAL_ALPHA_INTERNAL, 1.0, 0.5], device=logits.device)
+        
+        focal_term = alpha * (1 - p) ** FOCAL_GAMMA
+        loss = -torch.sum(labels * focal_term * log_p, dim=-1).mean()
+        
         return (loss, outputs) if return_outputs else loss
 
 
