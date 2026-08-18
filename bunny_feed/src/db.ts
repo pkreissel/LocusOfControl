@@ -118,7 +118,7 @@ export function getDbClient() {
 
         if (!res.ok) {
           const errBody = await res.text().catch(() => '');
-          const err: any = new Error(`Turso HTTP ${res.status}: ${errBody}`);
+          const err: any = new Error(`Turso HTTP ${res.status}: ${errBody} (SQL: ${sqlText.slice(0, 100)}...)`);
           err.retryable = DB_RETRYABLE_STATUS.has(res.status);
           throw err;
         }
@@ -127,7 +127,7 @@ export function getDbClient() {
         const first = json?.results?.[0];
         if (!first || first.type === 'error') {
           // A real SQL error — surface it immediately, never retry.
-          throw new Error(`Turso query failed: ${first?.error?.message ?? 'unknown error'}`);
+          throw new Error(`Turso query failed: ${first?.error?.message ?? 'unknown error'} (SQL: ${sqlText.slice(0, 100)}...)`);
         }
 
         const result = first.response?.result;
@@ -143,7 +143,7 @@ export function getDbClient() {
         const isQueryError = typeof e?.message === 'string' && e.message.startsWith('Turso query failed');
         const transient = !isQueryError && e?.retryable !== false;
         if (!transient || attempt === DB_MAX_ATTEMPTS) throw e;
-        console.warn(`[DB] transient failure (attempt ${attempt}/${DB_MAX_ATTEMPTS}), retrying:`, e?.message);
+        console.warn(`[DB] transient failure (attempt ${attempt}/${DB_MAX_ATTEMPTS}) for SQL '${sqlText.slice(0, 50)}...', retrying:`, e?.message);
       }
     }
     throw lastErr;
