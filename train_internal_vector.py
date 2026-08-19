@@ -55,8 +55,6 @@ def softmax_internal(logprobs, temperature):
 
 
 def get_p_internal(r, temperature):
-    if r.get("is_interaction"):
-        return 1.0 if r.get("loc_label") == "internal" else 0.0
     lp = r.get("raw_logprobs")
     if not lp:
         return 0.0
@@ -64,9 +62,6 @@ def get_p_internal(r, temperature):
 
 
 def get_expected_level(r, temperature):
-    if r.get("is_interaction"):
-        return 3.0 if r.get("loc_label") == "internal" else 1.0
-        
     level_lps = r.get("level_logprobs")
     if not level_lps:
         return 1.0

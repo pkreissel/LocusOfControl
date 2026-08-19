@@ -3,11 +3,22 @@ import json
 import logging
 from dotenv import load_dotenv
 from atproto import Client
+from openai import OpenAI
+import csv
+
+# Import the teacher annotation logic
+from create_synthetic_counterexamples import teacher_annotate
 
 logging.basicConfig(level=logging.INFO)
 
+API_BASE = os.environ.get("LOC_API_BASE", "http://127.0.0.1:8080/v1")
+DISAGREEMENTS_LOG = "backend/disagreements_log.csv"
+
 def main():
     load_dotenv()
+    
+    # Init LLM client
+    llm_client = OpenAI(base_url=API_BASE, api_key="test-key")
     
     # Load interactions
     interactions_file = 'bunny_feed/interactions.json'
@@ -18,19 +29,7 @@ def main():
     with open(interactions_file, 'r', encoding='utf-8') as f:
         interactions = json.load(f)
 
-    # Count events to see what we have
-    events_count = {}
-    for inter in interactions:
-        evt = inter.get('event')
-        events_count[evt] = events_count.get(evt, 0) + 1
-    
-    logging.info(f"Events found: {events_count}")
-
     # We want to map requestLess to external (label=0.0)
-    # What about positive interactions?
-    # For now, let's just collect all interactions that are not "seen" 
-    # Or map specific ones: requestLess -> external, interactionLike -> internal
-    
     target_interactions = []
     for inter in interactions:
         evt = inter.get('event')
@@ -41,8 +40,6 @@ def main():
             label = 'internal' # positive for this feed
             target_interactions.append((inter['item'], label))
 
-    # Deduplicate by URI (take the most recent or strongest? let's just use a dict, last one wins or conflict resolution)
-    # Actually, a single post might have a Like and a requestLess? Unlikely but possible.
     uri_to_label = {}
     for uri, label in target_interactions:
         uri_to_label[uri] = label
@@ -73,30 +70,51 @@ def main():
         except Exception as e:
             logging.error(f"Error fetching chunk {i}: {e}")
 
-    # Create dataset
+    # Prepare disagreements CSV
+    os.makedirs(os.path.dirname(DISAGREEMENTS_LOG), exist_ok=True)
+    file_exists = os.path.isfile(DISAGREEMENTS_LOG)
+    
     output_file = 'dataset_interactions.jsonl'
-    with open(output_file, 'w', encoding='utf-8') as f:
-        for uri, label in uri_to_label.items():
+    success_count = 0
+    
+    with open(output_file, 'w', encoding='utf-8') as f, \
+         open(DISAGREEMENTS_LOG, 'a', encoding='utf-8', newline='') as csvfile:
+        
+        writer = csv.writer(csvfile)
+        if not file_exists:
+            writer.writerow(['URI', 'User Interaction', 'Teacher Label', 'Text'])
+            
+        for uri, user_label in uri_to_label.items():
             text = fetched_posts.get(uri)
             if text is not None:
-                # Synthesize somewhat confident logprobs (relaxed from strict 0/-10)
-                # Using -2.5 gives a softmax probability of roughly ~0.85 - 0.90
-                # depending on the temperature, rather than a rigid 0.9999.
-                raw_logprobs = {"internal": -2.5, "external": -2.5, "neutral": -2.5}
-                if label in raw_logprobs:
-                    raw_logprobs[label] = 0.0
+                try:
+                    # Pure teacher annotation
+                    lp, soft, teacher_label, lvl_lp, soft_lvl, loc_lvl = teacher_annotate(llm_client, text)
                     
-                record = {
-                    "uri": uri,
-                    "text": text,
-                    "loc_label": label,
-                    "raw_logprobs": raw_logprobs
-                }
-                f.write(json.dumps(record) + '\n')
+                    if user_label != teacher_label:
+                        logging.warning(f"DISAGREEMENT on {uri}: User said {user_label}, Teacher said {teacher_label}")
+                        writer.writerow([uri, user_label, teacher_label, text])
+                    
+                    record = {
+                        "uri": uri,
+                        "text": text,
+                        "loc_label": user_label, # Preserve the user's action for reference
+                        "teacher_label": teacher_label,
+                        "raw_logprobs": lp,
+                        "soft_labels": soft,
+                        "level_logprobs": lvl_lp,
+                        "soft_levels": soft_lvl,
+                        "loc_level": loc_lvl,
+                        "is_interaction": True
+                    }
+                    f.write(json.dumps(record) + '\n')
+                    success_count += 1
+                except Exception as e:
+                    logging.error(f"Failed to annotate {uri}: {e}")
             else:
                 logging.warning(f"Could not fetch text for URI: {uri}")
 
-    logging.info(f"Saved {len(fetched_posts)} posts to {output_file}")
+    logging.info(f"Saved {success_count} posts with pure teacher annotations to {output_file}")
 
 if __name__ == '__main__':
     main()
