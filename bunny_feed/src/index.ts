@@ -347,6 +347,8 @@ async function handleRequest(request: Request): Promise<Response> {
       // Exclude posts this user has already been shown so paging/refreshing
       // doesn't repeat them. Best-effort: a DB failure just means no exclusion
       // this request. Only meaningful when we know who the user is.
+      let tSeen = 0, tCand = 0, tEmbed = 0, tRank = 0, tStore = 0;
+      const tS_start = Date.now();
       let excludeUris: string[] = [];
       if (userDid) {
         excludeUris = await getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS)
@@ -359,7 +361,9 @@ async function handleRequest(request: Request): Promise<Response> {
         await pruneOldSeenInteractions(SEEN_RETENTION_DAYS)
           .catch((e: any) => console.error("[getFeedSkeleton] seen prune failed:", errChain(e)));
       }
+      tSeen = Date.now() - tS_start;
 
+      const tC_start = Date.now();
       try {
         const genBody: any = {
           generators: [
@@ -391,11 +395,13 @@ async function handleRequest(request: Request): Promise<Response> {
       } catch (err: any) {
         console.error("[getFeedSkeleton] GE generate fetch failed:", err?.message || String(err));
       }
+      tCand = Date.now() - tC_start;
       
       const gatherMs = Date.now() - tG;
       const filteredCandidates: Candidate[] = [];
 
       if (candidates.length > 0) {
+        const tE_start = Date.now();
         // (3) Reuse cached vectors; only cache-missed posts are sent to Jina.
         const { embeddings, tokens } = await embedCandidates(candidates, apiKey);
         // Best-effort cost tracking; never let it break the feed response.
@@ -412,8 +418,10 @@ async function handleRequest(request: Request): Promise<Response> {
             filteredCandidates.push(candidates[i]);
           }
         }
+        tEmbed = Date.now() - tE_start;
         
         if (filteredCandidates.length > 0) {
+          const tR_start = Date.now();
           // (4) Rank via Green Earth
           try {
             const rankRes = await fetch('https://api.greenearth.social/rank/predict', {
@@ -452,8 +460,10 @@ async function handleRequest(request: Request): Promise<Response> {
           // doesn't produce (we embed with Jina), so it couldn't diversify
           // anyway. Rank order is now the final feed order.
         }
+        tRank = Date.now() - tR_start;
       }
 
+      const tSt_start = Date.now();
       // The full ranked list for this scroll session. Page 1 freezes it in a
       // feed_sessions row and serves only the first `limit` posts; the cursor
       // lets later pages slice further into this exact ordering without
@@ -471,6 +481,7 @@ async function handleRequest(request: Request): Promise<Response> {
         await pruneOldFeedSessions(Date.now() - SESSION_TTL_MS)
           .catch((e: any) => console.error("[getFeedSkeleton] session prune failed:", errChain(e)));
       }
+      tStore = Date.now() - tSt_start;
 
       const page = rankedUris.slice(0, limit);
       const feed: { post: string }[] = page.map(uri => ({ post: uri }));
@@ -513,6 +524,7 @@ async function handleRequest(request: Request): Promise<Response> {
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
+        tSeen, tCand, tEmbed, tRank, tStore
       });
 
       return new Response(JSON.stringify(body), {
