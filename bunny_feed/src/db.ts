@@ -225,7 +225,11 @@ export async function putEmbeddings(entries: { uri: string; vec: number[] }[], m
 // to keep the table bounded.
 export async function pruneOldEmbeddings(cutoffTs: number): Promise<void> {
   const db = getDbClient();
-  await db.delete(postEmbeddings).where(lt(postEmbeddings.createdAt, cutoffTs));
+  const toDelete = db.select({ uri: postEmbeddings.uri })
+    .from(postEmbeddings)
+    .where(lt(postEmbeddings.createdAt, cutoffTs))
+    .limit(1000);
+  await db.delete(postEmbeddings).where(inArray(postEmbeddings.uri, toDelete));
 }
 
 // --- Cursor-pagination session store -------------------------------------
@@ -280,7 +284,11 @@ export async function getFeedSession(
 // opportunistically like the other prunes.
 export async function pruneOldFeedSessions(cutoffTs: number): Promise<void> {
   const db = getDbClient();
-  await db.delete(feedSessions).where(lt(feedSessions.createdAt, cutoffTs));
+  const toDelete = db.select({ id: feedSessions.id })
+    .from(feedSessions)
+    .where(lt(feedSessions.createdAt, cutoffTs))
+    .limit(1000);
+  await db.delete(feedSessions).where(inArray(feedSessions.id, toDelete));
 }
 
 export async function recordInteraction(did: string | null, item: string, event: string, feedContext?: string) {
@@ -363,10 +371,12 @@ export async function getSeenUris(did: string, limit: number, withinDays: number
 // shared SEEN_EVENT id (declared above getSeenUris).
 export async function pruneOldSeenInteractions(retentionDays: number): Promise<void> {
   const db = getDbClient();
-  await db.delete(feedInteractions).where(
-    and(
-      eq(feedInteractions.event, SEEN_EVENT),
-      lt(feedInteractions.createdAt, sql`datetime('now', ${`-${retentionDays} days`})`),
-    ),
-  );
+  const cutoff = sql`datetime('now', ${`-${retentionDays} days`})`;
+
+  const toDelete = db.select({ id: feedInteractions.id })
+    .from(feedInteractions)
+    .where(and(eq(feedInteractions.event, SEEN_EVENT), lt(feedInteractions.createdAt, cutoff)))
+    .limit(1000);
+
+  await db.delete(feedInteractions).where(inArray(feedInteractions.id, toDelete));
 }

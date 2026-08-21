@@ -347,21 +347,23 @@ async function handleRequest(request: Request): Promise<Response> {
       // Exclude posts this user has already been shown so paging/refreshing
       // doesn't repeat them. Best-effort: a DB failure just means no exclusion
       // this request. Only meaningful when we know who the user is.
-      let tSeen = 0, tCand = 0, tEmbed = 0, tRank = 0, tStore = 0;
-      const tS_start = Date.now();
+      let tSeen = 0, tPrune = 0, tCand = 0, tEmbed = 0, tRank = 0, tStore = 0;
+      let tS_start = Date.now();
       let excludeUris: string[] = [];
       if (userDid) {
         excludeUris = await getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS)
           .catch((e: any) => { console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e)); return []; });
       }
+      tSeen = Date.now() - tS_start;
 
       // Opportunistically age out old "shown" rows so the table stays bounded
       // without a separate cron (engaged rows are kept for training).
+      tS_start = Date.now();
       if (Math.random() < SEEN_PRUNE_PROBABILITY) {
         await pruneOldSeenInteractions(SEEN_RETENTION_DAYS)
           .catch((e: any) => console.error("[getFeedSkeleton] seen prune failed:", errChain(e)));
       }
-      tSeen = Date.now() - tS_start;
+      tPrune = Date.now() - tS_start;
 
       const tC_start = Date.now();
       try {
@@ -524,7 +526,7 @@ async function handleRequest(request: Request): Promise<Response> {
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
-        tSeen, tCand, tEmbed, tRank, tStore
+        tSeen, tPrune, tCand, tEmbed, tRank, tStore
       });
 
       return new Response(JSON.stringify(body), {
