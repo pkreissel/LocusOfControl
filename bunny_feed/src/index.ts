@@ -461,8 +461,8 @@ async function handleRequest(request: Request): Promise<Response> {
           // visible effect). It also expects minilm embeddings, which this feed
           // doesn't produce (we embed with Jina), so it couldn't diversify
           // anyway. Rank order is now the final feed order.
+          tRank = Date.now() - tR_start;
         }
-        tRank = Date.now() - tR_start;
       }
 
       const tSt_start = Date.now();
