@@ -18,9 +18,11 @@ function errChain(e: any): string {
   return parts.join(' <- ');
 }
 
-// Calibrated on the live Discover feed (447-post sample): p>=0.35 passes ~25%
-// of candidates. The old 0.15 passed ~96%, effectively no filtering.
-const VECTOR_PROB_THRESHOLD = 0.25;
+// Based on real data distribution, probabilities have shifted. 0.55 passes ~50%, 0.60 passes ~25%.
+const VECTOR_PROB_THRESHOLD = 0.55;
+
+// Maximum number of candidates to send to the final GE reranker (rank/predict)
+const MAX_RERANK_CANDIDATES = 100;
 
 // Weight of the Jina vector-similarity signal in GE's reranker, relative to the
 // two_tower model (fixed at 1.0). We stash each surviving candidate's similarity
@@ -375,7 +377,7 @@ async function handleRequest(request: Request): Promise<Response> {
           ],
           infill: 'popularity',
           user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
-          num_candidates: 1000
+          num_candidates: 500
         };
         // Only send the key when non-empty so the unauthenticated path stays
         // byte-identical to before and we never send an empty array.
@@ -420,6 +422,13 @@ async function handleRequest(request: Request): Promise<Response> {
             filteredCandidates.push(candidates[i]);
           }
         }
+        
+        // Sort descending by vector probability and enforce maximum limit
+        filteredCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
+        if (filteredCandidates.length > MAX_RERANK_CANDIDATES) {
+          filteredCandidates.length = MAX_RERANK_CANDIDATES;
+        }
+
         tEmbed = Date.now() - tE_start;
         
         if (filteredCandidates.length > 0) {

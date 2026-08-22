@@ -22,7 +22,7 @@ if (!JINA_API_KEY) throw new Error("Missing JINA_API_KEY in .env");
 import { getEmbeddings } from './src/jina';
 import { scoreEmbedding } from './src/vector';
 
-const VECTOR_PROB_THRESHOLD = 0.35;
+const VECTOR_PROB_THRESHOLD = 0.55;
 
 async function runTest() {
   if (GREEN_EARTH_API_KEY === 'MISSING') {
@@ -49,7 +49,7 @@ async function runTest() {
   console.log("Available Models:", modelList.rankers);
 
   // Hardcode selections based on user request
-  let genToUse = 'followed_users';
+  let genToUse = 'popularity';
   let modelToUse = 'perspective';
   
   // 1. Generate Candidates
@@ -61,7 +61,7 @@ async function runTest() {
     body: JSON.stringify({
       generators: [{ name: genToUse, weight: 1.0 }],
       user_did: USER_DID,
-      num_candidates: 1000
+      num_candidates: 500
     })
   });
   if (!candRes.ok) {
@@ -88,12 +88,32 @@ async function runTest() {
   const embeddings = jinaRes.embeddings;
   const filteredCandidates = [];
   
+  const probs = embeddings.map(emb => scoreEmbedding(emb).probability);
+  probs.sort((a, b) => b - a); // descending
+
+  console.log(`\n--- Vector Probability Distribution ---`);
+  console.log(`Max: ${probs[0]?.toFixed(3)}`);
+  console.log(`Top 10%: ${probs[Math.floor(probs.length * 0.1)]?.toFixed(3)}`);
+  console.log(`Top 25%: ${probs[Math.floor(probs.length * 0.25)]?.toFixed(3)}`);
+  console.log(`Top 50%: ${probs[Math.floor(probs.length * 0.5)]?.toFixed(3)}`);
+  console.log(`Top 75%: ${probs[Math.floor(probs.length * 0.75)]?.toFixed(3)}`);
+  console.log(`Min: ${probs[probs.length - 1]?.toFixed(3)}`);
+  console.log(`---------------------------------------\n`);
+
   for (let i = 0; i < candidates.length; i++) {
     const score = scoreEmbedding(embeddings[i]);
     if (score.probability >= VECTOR_PROB_THRESHOLD) {
+      candidates[i].score = score.probability;
       filteredCandidates.push(candidates[i]);
     }
   }
+
+  // Sort descending by vector probability and enforce maximum limit
+  filteredCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
+  if (filteredCandidates.length > 100) {
+    filteredCandidates.length = 100;
+  }
+
   const tClassify = Date.now() - tStart;
   console.log(`    -> Kept ${filteredCandidates.length}/${candidates.length} candidates in ${tClassify}ms`);
 
