@@ -26,10 +26,12 @@ app.add_middleware(
 )
 
 # Initialize the model pipeline globally
+import torch
 MODEL_PATH = os.environ.get("LOC_CLASSIFIER_PATH", "../loc-classifier-bonsai-v2/final_model")
 try:
-    classifier = pipeline("text-classification", model=MODEL_PATH, top_k=None)
-    print(f"Loaded classifier from {MODEL_PATH}")
+    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+    classifier = pipeline("text-classification", model=MODEL_PATH, top_k=None, device=device)
+    print(f"Loaded classifier from {MODEL_PATH} on {device}")
 except Exception as e:
     print(f"Error loading classifier: {e}")
     classifier = None

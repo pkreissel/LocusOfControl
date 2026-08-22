@@ -28,9 +28,10 @@ class VectorScorer:
         self.scale = meta["scale"]
         self.bias = meta["bias"]
         self.task = meta["embedding_task"]
+        self.device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
         self.model = AutoModel.from_pretrained(
             meta["embedding_model"], torch_dtype=torch.float32, trust_remote_code=True
-        ).eval()
+        ).to(self.device).eval()
 
     def score(self, texts):
         """Return a list of {'cosine': float, 'internalProb': float} per text."""
