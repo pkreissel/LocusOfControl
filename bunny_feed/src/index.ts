@@ -441,7 +441,7 @@ async function handleRequest(request: Request): Promise<Response> {
               body: JSON.stringify({
                 candidates: filteredCandidates,
                 models: [
-                  { name: 'two_tower', weight: 1.0 },
+                  { name: 'heavy_ranker', weight: 1.0 },
                   // Blend in vector similarity (stashed in each candidate's
                   // `score` above) so more semantically-similar posts rank higher.
                   { name: 'candidate_score', weight: RANK_SIM_WEIGHT },

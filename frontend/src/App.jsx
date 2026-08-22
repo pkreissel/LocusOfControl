@@ -2,14 +2,15 @@ import { useState, useEffect } from 'react'
 import './index.css'
 
 // Score used for sorting and the badge, given the active method and sort mode.
-// The vector method only scores "internal", so it ignores sortMode.
-function getScore(post, method, sortMode) {
-  if (method === 'vector') return post.vectorInternalScore
+function getScore(post, method, sortMode, vectorWeight = 2.5) {
+  if (method === 'vector') {
+    return (post.heavyRankerScore || 0) + (vectorWeight * (post.vectorInternalScore || 0))
+  }
   if (method === 'disagreement') return Math.abs((post.internalScore || 0) - (post.vectorInternalScore || 0))
   return sortMode === 'internal' ? post.internalScore : post.externalScore
 }
 
-function PostCard({ post, sortMode, method }) {
+function PostCard({ post, sortMode, method, vectorWeight }) {
   const [liked, setLiked] = useState(false)
   const [reposted, setReposted] = useState(false)
 
@@ -25,9 +26,9 @@ function PostCard({ post, sortMode, method }) {
   // Determine which score to highlight based on current method and sort mode
   const isVector = method === 'vector'
   const isInternal = isVector || sortMode === 'internal'
-  const scoreToDisplay = getScore(post, method, sortMode)
-  const badgeLabel = isVector ? 'Vector Internal' : (isInternal ? 'Internal LoC' : 'External LoC')
-  const badgeEmoji = isVector ? '🎯' : (isInternal ? '🧠' : '🌍')
+  const scoreToDisplay = getScore(post, method, sortMode, vectorWeight)
+  const badgeLabel = isVector ? 'Combined Rank' : (isInternal ? 'Internal LoC' : 'External LoC')
+  const badgeEmoji = isVector ? '🏅' : (isInternal ? '🧠' : '🌍')
 
   return (
     <div className="post-card">
@@ -48,7 +49,7 @@ function PostCard({ post, sortMode, method }) {
           </div>
         ) : (
           <div className={`score-badge ${!isInternal ? 'external-badge' : ''}`}>
-            {badgeEmoji} {badgeLabel}: {((scoreToDisplay || 0) * 100).toFixed(1)}%
+            {badgeEmoji} {badgeLabel}: {isVector ? (scoreToDisplay || 0).toFixed(2) : ((scoreToDisplay || 0) * 100).toFixed(1) + '%'}
           </div>
         )}
       </div>
@@ -85,6 +86,7 @@ function App() {
   const [error, setError] = useState(null)
   const [sortMode, setSortMode] = useState('internal') // 'internal' or 'external'
   const [method, setMethod] = useState('classifier') // 'classifier' or 'vector'
+  const [vectorWeight, setVectorWeight] = useState(2.5) // Default weight for vector score vs heavy ranker
 
   const fetchPosts = () => {
     setPosts([])
@@ -93,7 +95,7 @@ function App() {
 
     // method=both: every post carries classifier and vector scores, so
     // switching methods client-side compares them on the same feed items
-    const eventSource = new EventSource('/api/posts?method=both')
+    const eventSource = new EventSource(`/api/posts?method=both&vector_weight=${vectorWeight}`)
 
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data)
@@ -115,7 +117,7 @@ function App() {
         // Note: the list is re-sorted dynamically during render and state updates,
         // but we keep the base list as is here, or we sort it based on current mode
         return newList.sort((a, b) =>
-          (getScore(b, method, sortMode) || 0) - (getScore(a, method, sortMode) || 0)
+          (getScore(b, method, sortMode, vectorWeight) || 0) - (getScore(a, method, sortMode, vectorWeight) || 0)
         );
       })
     }
@@ -137,15 +139,15 @@ function App() {
     }
   }
 
-  // When sort mode or method changes, re-sort the existing posts
+  // When sort mode, method, or vector weight changes, re-sort the existing posts
   useEffect(() => {
     setPosts(prev => {
       const newList = [...prev];
       return newList.sort((a, b) =>
-        (getScore(b, method, sortMode) || 0) - (getScore(a, method, sortMode) || 0)
+        (getScore(b, method, sortMode, vectorWeight) || 0) - (getScore(a, method, sortMode, vectorWeight) || 0)
       );
     })
-  }, [sortMode, method])
+  }, [sortMode, method, vectorWeight])
 
   // Initial fetch
   useEffect(() => {
@@ -188,17 +190,50 @@ function App() {
           >
             🧠 Sort by Internal
           </button>
-          <button
-            className={`toggle-btn ${sortMode === 'external' ? 'active' : ''}`}
-            onClick={() => setSortMode('external')}
-            disabled={method === 'vector'}
-            style={method === 'vector' ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
-            title={method === 'vector' ? 'The vector method only scores internal LoC' : undefined}
-          >
-            🌍 Sort by External
-          </button>
-        </div>
-      </header>
+            <button
+              className={`toggle-btn ${sortMode === 'external' ? 'active' : ''}`}
+              onClick={() => setSortMode('external')}
+              disabled={method === 'vector'}
+              style={method === 'vector' ? { opacity: 0.4, cursor: 'not-allowed' } : undefined}
+              title={method === 'vector' ? 'The vector method only scores internal LoC' : undefined}
+            >
+              🌍 Sort by External
+            </button>
+          </div>
+
+          <div style={{ marginTop: '1.5rem', padding: '1rem', background: 'rgba(255,255,255,0.05)', borderRadius: '12px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem' }}>
+              <label style={{ fontSize: '0.9rem', color: 'var(--text-secondary)' }}>
+                Vector Score vs Heavy Ranker Weight: <strong>{vectorWeight}</strong>
+              </label>
+              <input 
+                type="range" 
+                min="0" 
+                max="10" 
+                step="0.1" 
+                value={vectorWeight} 
+                onChange={(e) => setVectorWeight(parseFloat(e.target.value))} 
+                style={{ width: '250px' }}
+              />
+              <button 
+                onClick={fetchPosts}
+                disabled={scanning}
+                style={{
+                  marginTop: '0.5rem',
+                  padding: '0.4rem 1rem',
+                  background: 'var(--accent-color)',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: scanning ? 'not-allowed' : 'pointer',
+                  opacity: scanning ? 0.7 : 1
+                }}
+              >
+                {scanning ? 'Scanning...' : 'Fetch New Feed'}
+              </button>
+            </div>
+          </div>
+        </header>
 
       <main>
         {error && (
@@ -251,7 +286,7 @@ function App() {
             const isVectorInternal = (post.vectorInternalScore || 0) >= 0.25;
             return isClassifierInternal !== isVectorInternal;
           }).map((post, i) => (
-            <PostCard key={post.uri || i} post={post} sortMode={sortMode} method={method} />
+            <PostCard key={post.uri || i} post={post} sortMode={sortMode} method={method} vectorWeight={vectorWeight} />
           ))}
         </div>
         
