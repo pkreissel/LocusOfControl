@@ -33,6 +33,22 @@ const RANK_SIM_WEIGHT = 2.5;
 declare const process: any;
 declare const Bunny: any;
 
+// Run best-effort work *after* the response is sent. Bunny's edge runtime keeps
+// the isolate alive until the promise settles (`Bunny.v1.waitUntil`), which is
+// the sanctioned way to do post-response IO (cache refresh, telemetry, our table
+// prunes) without adding latency to the request — unlike an un-registered
+// dangling promise, whose deferred `fetch` escapes the request's async context
+// and throws (see the transport note in db.ts). Callers MUST attach their own
+// `.catch`: a rejected waitUntil promise still settles, but we never want it to
+// surface as an unhandled rejection or break the response. Off the edge
+// (local/test) there is no isolate to keep alive, so the already-running promise
+// is simply left to complete unawaited.
+function runAfterResponse(promise: Promise<unknown>): void {
+  if (typeof Bunny !== 'undefined' && Bunny.v1?.waitUntil) {
+    Bunny.v1.waitUntil(promise);
+  }
+}
+
 function getEnv(key: string): string | undefined {
   if (typeof Bunny !== 'undefined' && Bunny.env) return Bunny.env[key];
   if (typeof process !== 'undefined' && process.env) return process.env[key];
@@ -195,10 +211,13 @@ async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ em
       .catch((e: any) => console.error("[embed cache] write failed:", errChain(e)));
   }
 
-  // Opportunistically keep the table bounded.
+  // Opportunistically keep the table bounded. Deferred past the response via
+  // waitUntil so the prune never adds latency to the request.
   if (Math.random() < EMBED_PRUNE_PROBABILITY) {
-    await pruneOldEmbeddings(Date.now() - EMBED_CACHE_MAX_AGE_MS)
-      .catch((e: any) => console.error("[embed cache] prune failed:", errChain(e)));
+    runAfterResponse(
+      pruneOldEmbeddings(Date.now() - EMBED_CACHE_MAX_AGE_MS)
+        .catch((e: any) => console.error("[embed cache] prune failed:", errChain(e)))
+    );
   }
 
   return { embeddings, tokens };
@@ -401,11 +420,14 @@ async function handleRequest(request: Request): Promise<Response> {
       tSeen = Date.now() - tS_start;
 
       // Opportunistically age out old "shown" rows so the table stays bounded
-      // without a separate cron (engaged rows are kept for training).
+      // without a separate cron (engaged rows are kept for training). Deferred
+      // past the response via waitUntil, so tPrune now only bounds the dispatch.
       tS_start = Date.now();
       if (Math.random() < SEEN_PRUNE_PROBABILITY) {
-        await pruneOldSeenInteractions(SEEN_RETENTION_DAYS)
-          .catch((e: any) => console.error("[getFeedSkeleton] seen prune failed:", errChain(e)));
+        runAfterResponse(
+          pruneOldSeenInteractions(SEEN_RETENTION_DAYS)
+            .catch((e: any) => console.error("[getFeedSkeleton] seen prune failed:", errChain(e)))
+        );
       }
       tPrune = Date.now() - tS_start;
 
@@ -530,9 +552,12 @@ async function handleRequest(request: Request): Promise<Response> {
       }
 
       // Opportunistically prune expired sessions so the table stays bounded.
+      // Deferred past the response via waitUntil so it adds no request latency.
       if (Math.random() < SESSION_PRUNE_PROBABILITY) {
-        await pruneOldFeedSessions(Date.now() - SESSION_TTL_MS)
-          .catch((e: any) => console.error("[getFeedSkeleton] session prune failed:", errChain(e)));
+        runAfterResponse(
+          pruneOldFeedSessions(Date.now() - SESSION_TTL_MS)
+            .catch((e: any) => console.error("[getFeedSkeleton] session prune failed:", errChain(e)))
+        );
       }
       tStore = Date.now() - tSt_start;
 
