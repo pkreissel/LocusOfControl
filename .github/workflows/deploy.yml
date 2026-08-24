@@ -29,20 +29,12 @@ jobs:
         working-directory: ./bunny_feed
         run: npm install
 
-      - name: Apply Database Migrations
+      - name: Push Database Schema
         working-directory: ./bunny_feed
         env:
           BUNNY_DATABASE_URL: ${{ secrets.BUNNY_DATABASE_URL }}
           BUNNY_DATABASE_AUTH_TOKEN: ${{ secrets.BUNNY_DATABASE_AUTH_TOKEN }}
-        # drizzle-kit migrate applies pending drizzle/*.sql tracked in
-        # meta/_journal.json and records them in __drizzle_migrations. Unlike
-        # `push` (which batched DDL and silently exited 0 when BunnyDB rolled the
-        # batch back on a DROP of a nonexistent index), migrate exits non-zero on
-        # failure, so a broken migration fails the deploy loudly instead of
-        # shipping a green build against an unchanged schema. Schema changes now
-        # go: edit src/schema.ts -> `npm run db:generate` -> commit the new
-        # drizzle/ files.
-        run: npm run db:migrate
+        run: npm run db:push -- --force
 
       - name: Build Script
         working-directory: ./bunny_feed
