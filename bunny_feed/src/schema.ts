@@ -43,6 +43,10 @@ export const feedSessions = sqliteTable('feed_sessions', {
   // Serves the opportunistic prune (WHERE created_at < cutoff). created_at is
   // monotonic, so inserts append to the index edge.
   index('feed_sessions_created_at_idx').on(t.createdAt),
+  // Serves the page-1 reuse read (getLatestFeedSession: WHERE did=? ORDER BY
+  // created_at DESC LIMIT 1) so a logged-in START request can reuse the user's
+  // most recent frozen ranked list instead of re-running the pipeline.
+  index('feed_sessions_did_created_at_idx').on(t.did, t.createdAt),
 ]);
 
 export const feedInteractions = sqliteTable('feed_interactions', {

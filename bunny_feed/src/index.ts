@@ -1,7 +1,7 @@
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddings, EMBEDDING_MODEL } from './jina';
 import { scoreEmbedding } from './vector';
-import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings, putFeedSession, getFeedSession, pruneOldFeedSessions } from './db';
+import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
 console.log("Bunny Edge Script module initialized");
@@ -102,6 +102,13 @@ const SESSION_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
 const SESSION_PRUNE_PROBABILITY = 0.02;
+// Page-1 reuse window. A logged-in START request re-runs the whole pipeline
+// today; within this window we instead re-serve the user's most recent frozen
+// ranked list, so a reload / crash-retry / quick re-open costs one indexed DB
+// read instead of generate→embed→rank. Kept short so seen-post exclusion (baked
+// into the list at generation) refreshes soon; within it, re-showing the same
+// top-of-feed is the expected reload behavior, not staleness.
+const START_REUSE_TTL_MS = 90 * 1000;
 
 function parseLimit(raw: string | null): number {
   const n = raw ? parseInt(raw, 10) : NaN;
@@ -332,6 +339,41 @@ async function handleRequest(request: Request): Promise<Response> {
           });
         }
         // Session gone/stale/foreign → fall through to a fresh page 1.
+      }
+
+      // (2b) Fresh page-1 reuse. A logged-in START request (no cursor) otherwise
+      // re-runs the entire generate→embed→rank pipeline on every reload, crash
+      // retry, or quick re-open. If this user produced a ranked list within
+      // START_REUSE_TTL_MS, re-serve its first window (and a cursor into it)
+      // instead. The frozen list already had interactionSeen exclusion applied
+      // when generated; the reuse window is short enough that the only
+      // not-yet-excluded posts are ones shown seconds ago — i.e. what's on screen,
+      // which a reload should keep showing anyway. Best-effort: any read failure
+      // falls through to a fresh generation.
+      if (userDid && !startCursor) {
+        const latest = await getLatestFeedSession(userDid)
+          .catch((e: any) => { console.error("[getFeedSkeleton] latest-session read failed:", errChain(e)); return null; });
+        if (latest && latest.uris.length > 0 && (Date.now() - latest.createdAt) < START_REUSE_TTL_MS) {
+          const page = latest.uris.slice(0, limit);
+          const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
+          if (limit < latest.uris.length) body.cursor = encodeCursor(latest.sessionId, limit);
+          logFeed({
+            did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'reuse',
+            off: 0, limit, feedLen: page.length,
+            nextCursor: body.cursor ? 'y' : 'n', ms: Date.now() - t0,
+          });
+          return new Response(JSON.stringify(body), {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Cache': 'miss',
+              'X-Page-Path': 'reuse',
+              // Same reasoning as the other personalized paths: keep the PullZone
+              // CDN out of it; our per-user session store already caches.
+              'Cache-Control': 'no-store',
+              'X-Feed-Version': 'pagination-1',
+            },
+          });
+        }
       }
 
       let candidates: Candidate[] = [];

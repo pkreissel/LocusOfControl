@@ -1,0 +1,1 @@
+CREATE INDEX `feed_sessions_did_created_at_idx` ON `feed_sessions` (`did`,`created_at`);

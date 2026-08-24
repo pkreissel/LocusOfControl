@@ -80,6 +80,14 @@ function toHttpUrl(url: string): string {
 // awaited fetch — the shape that actually works here.
 const DB_RETRYABLE_STATUS = new Set([421, 429, 500, 502, 503, 504]);
 const DB_MAX_ATTEMPTS = 3;
+// Per-attempt wall-clock cap on a single BunnyDB HTTP round-trip. The driver is
+// stateless HTTP (one POST /v2/pipeline per query, no pooling), so the FIRST DB
+// call of a request eats the cost of Bunny attaching a cold edge replica — which
+// has been observed to hang for tens of seconds. Without a cap, a single cold
+// getSeenUris read blocked a feed request for ~54s. Abort a stalled attempt so it
+// falls into the retry/fallback path (best-effort reads like getSeenUris then just
+// skip exclusion for that request instead of gating it).
+const DB_REQUEST_TIMEOUT_MS = 10000;
 
 let _drizzleDb: ReturnType<typeof drizzle> | null = null;
 
@@ -106,6 +114,10 @@ export function getDbClient() {
 
     let lastErr: any;
     for (let attempt = 1; attempt <= DB_MAX_ATTEMPTS; attempt++) {
+      const ac = new AbortController();
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; ac.abort(); }, DB_REQUEST_TIMEOUT_MS);
+      const tReq = Date.now();
       try {
         const res = await fetch(endpoint, {
           method: 'POST',
@@ -114,6 +126,7 @@ export function getDbClient() {
             'Content-Type': 'application/json',
           },
           body,
+          signal: ac.signal,
         });
 
         if (!res.ok) {
@@ -137,6 +150,17 @@ export function getDbClient() {
         return { rows: method === 'get' ? rows[0] : rows };
       } catch (e: any) {
         lastErr = e;
+        if (timedOut) {
+          // Our AbortController fired: the request outran DB_REQUEST_TIMEOUT_MS.
+          // Log it distinctly (this is the cold-replica stall we cap) and rewrite
+          // the opaque AbortError into something greppable and retryable.
+          console.warn(`[DB] request timeout after ${Date.now() - tReq}ms (>${DB_REQUEST_TIMEOUT_MS}ms, attempt ${attempt}/${DB_MAX_ATTEMPTS}) for SQL '${sqlText.slice(0, 50)}...'`);
+          const te: any = new Error(`DB request timeout after ${DB_REQUEST_TIMEOUT_MS}ms (SQL: ${sqlText.slice(0, 100)}...)`);
+          te.retryable = true;
+          lastErr = te;
+          if (attempt === DB_MAX_ATTEMPTS) throw te;
+          continue;
+        }
         // Retry transient transport failures: a flagged-retryable HTTP status,
         // or a thrown fetch/network error (which has no `retryable` flag). A
         // "Turso query failed" SQL error is explicitly non-retryable.
@@ -144,6 +168,8 @@ export function getDbClient() {
         const transient = !isQueryError && e?.retryable !== false;
         if (!transient || attempt === DB_MAX_ATTEMPTS) throw e;
         console.warn(`[DB] transient failure (attempt ${attempt}/${DB_MAX_ATTEMPTS}) for SQL '${sqlText.slice(0, 50)}...', retrying:`, e?.message);
+      } finally {
+        clearTimeout(timer);
       }
     }
     throw lastErr;
@@ -274,6 +300,34 @@ export async function getFeedSession(
     const uris = JSON.parse(row.uris);
     if (!Array.isArray(uris)) return null;
     return { uris, did: row.did, createdAt: row.createdAt };
+  } catch {
+    return null;
+  }
+}
+
+// Fetch a user's MOST RECENT frozen session, so a fresh page-1 (START) request
+// can reuse a just-computed ranked list instead of re-running the whole
+// generate→embed→rank pipeline on every reload / crash-retry / quick re-open.
+// Scoped to the owning DID and ordered by recency; the caller enforces the reuse
+// freshness window. Backed by the (did, created_at) index. Returns null on miss
+// or parse failure so the caller falls back to a fresh generation.
+export async function getLatestFeedSession(
+  did: string,
+): Promise<{ sessionId: string; uris: string[]; createdAt: number } | null> {
+  if (!did) return null;
+  const db = getDbClient();
+  const rows = await db
+    .select({ id: feedSessions.id, uris: feedSessions.uris, createdAt: feedSessions.createdAt })
+    .from(feedSessions)
+    .where(eq(feedSessions.did, did))
+    .orderBy(desc(feedSessions.createdAt))
+    .limit(1);
+  const row = (rows as { id: string; uris: string; createdAt: number }[])[0];
+  if (!row) return null;
+  try {
+    const uris = JSON.parse(row.uris);
+    if (!Array.isArray(uris)) return null;
+    return { sessionId: row.id, uris, createdAt: row.createdAt };
   } catch {
     return null;
   }
