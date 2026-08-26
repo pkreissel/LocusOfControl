@@ -207,8 +207,10 @@ async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ em
 
     // One batched upsert of the freshly-computed vectors.
     const toStore = missUris.map((uri, k) => ({ uri, vec: res.embeddings[k] }));
-    await putEmbeddings(toStore, EMBEDDING_MODEL)
-      .catch((e: any) => console.error("[embed cache] write failed:", errChain(e)));
+    runAfterResponse(
+      putEmbeddings(toStore, EMBEDDING_MODEL)
+        .catch((e: any) => console.error("[embed cache] write failed:", errChain(e)))
+    );
   }
 
   // Opportunistically keep the table bounded. Deferred past the response via
