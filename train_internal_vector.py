@@ -1,8 +1,10 @@
 """Distill a single query vector for "internal" posts from LM Studio soft labels.
 
-Trains a Linear Ridge Regression against a continuous Target Score.
-Target Score = P(Internal) * Expected_Level
-Expected_Level is computed from the 3-level concreteness rubric.
+Trains a Linear Ridge Regression against a continuous Target Score. With v4
+teacher annotations the target is the graded 0-9 loc_score (expected value over
+the teacher's digit logprobs) — a genuinely rankable locus-of-control axis. For
+older data without loc_score it falls back to the legacy P(Internal)*Expected_Level,
+rescaled to the same [0,9] axis. See get_target_score / get_expected_score.
 
 Outputs internal_vector.npy (best model) and results_internal_vector.json.
 
@@ -28,15 +30,28 @@ CACHE_GEMINI_EMBS = "embeddings_gemini_jina.npz"
 VECTOR_OUT = os.environ.get("LOC_VECTOR_OUT", "internal_vector.npy")
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small"
 
-VALID_LABELS = ["internal", "external", "neutral"]
-LABEL_MAP = {"internal": 0, "external": 1, "neutral": 2}
-CACHE_TEMPERATURE = 2.0  # temperature baked into the cached y of the npz
-REFERENCE_T = 1.0  # fidelity is always measured against the teacher's raw softmax
+# Determine label set from prompt version
+_PROMPT_VER = os.environ.get("LOC_PROMPT_VERSION", "v1")
+if _PROMPT_VER == "assist":
+    VALID_LABELS = ["helpful", "inert", "neutral"]
+    LABEL_MAP = {"helpful": 0, "inert": 1, "neutral": 2}
+    POSITIVE_LABEL = "helpful"
+    NEGATIVE_LABEL = "inert"
+else:
+    VALID_LABELS = ["internal", "external", "neutral"]
+    LABEL_MAP = {"internal": 0, "external": 1, "neutral": 2}
+    POSITIVE_LABEL = "internal"
+    NEGATIVE_LABEL = "external"
+
+CACHE_TEMPERATURE = 2.0
+REFERENCE_T = 1.0
 TEMPERATURES = [0.5, 1.0, 2.0, 3.0, 5.0]
 L2_REGS = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0]
 SYNTH_WEIGHTS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 DEV_FRAC = 0.15
 SEED = 42
+
+
 
 
 def load_jsonl(path):
@@ -46,37 +61,106 @@ def load_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def softmax_internal(logprobs, temperature):
+def softmax_positive(logprobs, temperature):
+    """Softmax over the positive/neutral/negative labels based on prompt version."""
     logits = np.array(
-        [logprobs.get("internal", -20.0), logprobs.get("external", -20.0), logprobs.get("neutral", -20.0)]
+        [logprobs.get(POSITIVE_LABEL, -20.0), logprobs.get(NEGATIVE_LABEL, -20.0), logprobs.get("neutral", -20.0)]
     ) / temperature
     e = np.exp(logits - logits.max())
     return float(e[0] / e.sum())
 
 
-def get_p_internal(r, temperature):
+def get_p_positive(r, temperature):
     lp = r.get("raw_logprobs")
     if not lp:
         return 0.0
-    return softmax_internal(lp, temperature)
+    return softmax_positive(lp, temperature)
 
 
 def get_expected_level(r, temperature):
     level_lps = r.get("level_logprobs")
     if not level_lps:
         return 1.0
-        
+
     logits = np.array([level_lps.get(str(i), -20.0) for i in (1, 2, 3)]) / temperature
     e = np.exp(logits - logits.max())
     probs = e / e.sum()
-    
+
     return float(probs[0]*1 + probs[1]*2 + probs[2]*3)
 
 
+def get_expected_score(r, temperature):
+    """v4 graded 0-9 locus-of-control target: expected value over the teacher's
+    digit distribution, re-softmaxed at `temperature` (so the sweep can still
+    sharpen/soften). Returns None when the row has no graded score."""
+    lp = r.get("loc_score_logprobs")
+    if not lp:
+        return None
+    logits = np.array([lp.get(str(d), -20.0) for d in range(10)]) / temperature
+    e = np.exp(logits - logits.max())
+    probs = e / e.sum()
+    return float((probs * np.arange(10)).sum())
+
+
+# Target modes (LOC_TARGET_MODE):
+#   band   (default) - explicit 3-band ordering external(0) < neutral(NEU) < internal(6-9).
+#            This is what EXCLUDES external: the legacy target lumps external and neutral
+#            both at 0, so Ridge never learns external is worse than neutral and external
+#            leaks into the top. Internal intensity = smooth v4 loc_score if present, else
+#            derived from the concreteness level. Works on existing (pre-v4) data too.
+#   graded - raw v4 loc_score (0-9), neutral in the middle. Best teacher-fidelity but lets
+#            the neutral bulk crowd the internal head (worse internal detection).
+#   legacy - old P(internal)*E[level], rescaled to [0,9].
+TARGET_MODE = os.environ.get("LOC_TARGET_MODE", "band")
+NEU_BAND = float(os.environ.get("LOC_NEU_BAND", "2.0"))
+# Model-selection metric (a key in evaluate()'s dict). Default to the graded
+# ranking objective; set LOC_SELECT_METRIC=val_auc_internal for the old behavior.
+SELECT_METRIC = os.environ.get("LOC_SELECT_METRIC", "val_ndcg_graded")
+# Back-compat: LOC_USE_LOC_SCORE=0 forces the legacy target.
+if os.environ.get("LOC_USE_LOC_SCORE", "1") == "0":
+    TARGET_MODE = "legacy"
+
+
+def get_class(r, temperature):
+    """internal / external / neutral for a row: hard loc_label for interactions,
+    else argmax of the teacher's raw_logprobs."""
+    if r.get("is_interaction") and r.get("loc_label") in VALID_LABELS:
+        return r["loc_label"]
+    lp = r.get("raw_logprobs")
+    if lp:
+        a = np.array([lp.get(l, -20.0) for l in VALID_LABELS]) / temperature
+        return VALID_LABELS[int(a.argmax())]
+    return r.get("loc_label") if r.get("loc_label") in VALID_LABELS else "neutral"
+
+
+def get_positive_intensity(r, temperature):
+    """0-9 intensity for an internal post: smooth v4 loc_score when available,
+    else mapped from the 3-level concreteness rubric (1->6, 2->7.5, 3->9)."""
+    s = get_expected_score(r, temperature)
+    if s is not None:
+        return s
+    if r.get("loc_score") is not None:
+        return float(r["loc_score"])
+    return 6.0 + 1.5 * (get_expected_level(r, temperature) - 1.0)
+
+
 def get_target_score(r, temperature):
-    p_int = get_p_internal(r, temperature)
-    exp_lvl = get_expected_level(r, temperature)
-    return p_int * exp_lvl
+    if TARGET_MODE == "graded":
+        s = get_expected_score(r, temperature)
+        if s is not None:
+            return s
+        if r.get("loc_score") is not None:
+            return float(r["loc_score"])
+        return get_p_positive(r, temperature) * get_expected_level(r, temperature) * 3.0
+    if TARGET_MODE == "legacy":
+        return get_p_positive(r, temperature) * get_expected_level(r, temperature) * 3.0
+    # band (default): NEGATIVE_LABEL -> 0, neutral -> NEU_BAND, POSITIVE_LABEL -> intensity (6-9)
+    c = get_class(r, temperature)
+    if c == POSITIVE_LABEL:
+        return get_positive_intensity(r, temperature)
+    if c == "neutral":
+        return NEU_BAND
+    return 0.0
 
 
 def load_train_rows():
@@ -89,7 +173,7 @@ def load_train_rows():
         if not item.get("text"):
             continue
         lp = item.get("raw_logprobs")
-        if not lp or "internal" not in lp:
+        if not lp or POSITIVE_LABEL not in lp:
             continue
         item["is_interaction"] = False
         rows.append(item)
@@ -132,8 +216,9 @@ def rocchio_vector(X, y_target, sample_weight=None):
         sample_weight = np.ones(len(y_target))
     # Weighted average where weight is the target score
     pos = ((y_target * sample_weight)[:, None] * X).sum(axis=0) / ((y_target * sample_weight).sum() + 1e-9)
-    # Negative examples (score near 0)
-    neg_weights = (3.0 - y_target) * sample_weight
+    # Negative examples (score near 0); scale-agnostic so it works for the
+    # legacy [0,3] target and the v4 [0,9] loc_score alike.
+    neg_weights = (y_target.max() - y_target) * sample_weight
     neg = (neg_weights[:, None] * X).sum(axis=0) / (neg_weights.sum() + 1e-9)
     v = pos - neg
     return v / (np.linalg.norm(v) + 1e-9)
@@ -144,14 +229,17 @@ def precision_at_k(scores, is_relevant, k):
     return float(is_relevant[top].mean())
 
 
-def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask):
+def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
+             val_rel=None, val_external=None):
     m = {}
     s_dev = X_dev @ v
     m["dev_spearman_vs_teacher"] = float(spearmanr(s_dev, p_dev).statistic)
     m["dev_ndcg_teacher_rel"] = float(ndcg_score(p_dev[None, :], s_dev[None, :]))
-    
-    # Calculate AUC against teacher's thresholded labels on dev set
-    dev_binary = (p_dev > 1.5).astype(int) # p_ref ranges roughly from 0 to 3
+
+    # Calculate AUC against teacher's thresholded labels on dev set.
+    # Target is on the [0,9] loc_score axis (internal >= 6); 5.5 splits
+    # internal from neutral/external. (Legacy fallback is rescaled to [0,9] too.)
+    dev_binary = (p_dev > 5.5).astype(int)
     if len(np.unique(dev_binary)) > 1:
         m["dev_auc_teacher"] = float(roc_auc_score(dev_binary, s_dev))
     else:
@@ -166,6 +254,17 @@ def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask):
         m["val_spearman_vs_teacher"] = float(
             spearmanr(s_val[teacher_mask], p_val_teacher[teacher_mask]).statistic
         )
+
+    # Graded objective: internal high, external low. val_rel = {external:0,neutral:1,
+    # internal:2}. nDCG rewards internal-at-top; ext_leak_auc is AUC(external-as-positive)
+    # -> LOWER is better (external pushed down); ext_in_top25 counts leaked doomer posts.
+    if val_rel is not None:
+        m["val_ndcg_graded"] = float(ndcg_score(val_rel[None, :], s_val[None, :]))
+        m["val_spearman_graded"] = float(spearmanr(s_val, val_rel).statistic)
+    if val_external is not None and 0 < val_external.sum() < len(val_external):
+        m["val_ext_leak_auc"] = float(roc_auc_score(val_external, s_val))
+        top = np.argsort(-s_val)[:25]
+        m["val_ext_in_top25"] = int(val_external[top].sum())
     return m
 
 
@@ -207,7 +306,7 @@ def main():
     if not os.path.exists(CACHE_LMSTUDIO_EMBS):
         X = compute_embeddings([r["text"] for r in rows])
         # Cache both components so we don't have to recompute
-        y = np.array([[get_p_internal(r, CACHE_TEMPERATURE),
+        y = np.array([[get_p_positive(r, CACHE_TEMPERATURE),
                        get_expected_level(r, CACHE_TEMPERATURE)] for r in rows])
         np.savez_compressed(CACHE_LMSTUDIO_EMBS, X=X, y=y)
         
@@ -254,15 +353,19 @@ def main():
         X_val = X_val[keep]
         val_rows = [r for r, k in zip(val_rows, keep) if k]
         print(f"Using validation labels from {VAL_LABELS_FILE}: {len(val_rows)} posts")
-    val_internal = (y_val == LABEL_MAP["internal"]).astype(int)
-    print(f"Validation: {len(X_val)} posts, {val_internal.sum()} labeled internal "
-          f"({val_internal.mean():.1%})")
+    val_internal = (y_val == LABEL_MAP[POSITIVE_LABEL]).astype(int)
+    val_external = (y_val == LABEL_MAP[NEGATIVE_LABEL]).astype(int)
+    # Graded relevance for the "internal high, external low" objective.
+    _rel_by_class = {LABEL_MAP[POSITIVE_LABEL]: 2, LABEL_MAP["neutral"]: 1, LABEL_MAP[NEGATIVE_LABEL]: 0}
+    val_rel = np.array([_rel_by_class[int(y)] for y in y_val])
+    print(f"Validation: {len(X_val)} posts, {val_internal.sum()} internal / "
+          f"{val_external.sum()} external ({val_internal.mean():.1%} / {val_external.mean():.1%})")
 
     # Teacher soft targets for validation posts
     teacher_by_uri = {
         item["uri"]: item
         for item in load_jsonl(LMSTUDIO_FILE)
-        if item.get("raw_logprobs") and "internal" in item.get("raw_logprobs", {})
+        if item.get("raw_logprobs") and POSITIVE_LABEL in item.get("raw_logprobs", {})
     }
     teacher_mask = np.array([r["uri"] in teacher_by_uri for r in val_rows])
     print(f"Validation posts with teacher soft targets: {teacher_mask.sum()}/{len(val_rows)}")
@@ -304,20 +407,21 @@ def main():
                 w, _ = fit(X[train_idx], p_all[train_idx])
                 v = w / (np.linalg.norm(w) + 1e-9)
                 m = evaluate(v, X[dev_idx], p_ref[dev_idx], X_val, val_internal,
-                             p_val_teacher, teacher_mask)
+                             p_val_teacher, teacher_mask, val_rel, val_external)
                 key = f"{name}_T{T}_W{W}"
                 all_results[key] = m
-                print(f"{key:26s} devAUC={m.get('dev_auc_teacher', 0.0):.4f} "
-                      f"devSpear={m['dev_spearman_vs_teacher']:.4f} "
-                      f"valAUC={m['val_auc_internal']:.4f} "
-                      f"valAP={m['val_avg_precision']:.4f} "
-                      f"P@25={m['val_precision@25']:.2f}")
+                print(f"{key:26s} valAUC_int={m['val_auc_internal']:.4f} "
+                      f"extLeak={m.get('val_ext_leak_auc', 0.0):.4f} "
+                      f"gnDCG={m.get('val_ndcg_graded', 0.0):.4f} "
+                      f"gSpear={m.get('val_spearman_graded', 0.0):.4f} "
+                      f"ext@top25={m.get('val_ext_in_top25', -1)}")
+                # Select on the graded objective (internal high + external low).
                 if l2 is not None and (best is None or
-                                       m.get("dev_auc_teacher", 0.0) > best[4].get("dev_auc_teacher", 0.0)):
+                                       m.get(SELECT_METRIC, 0.0) > best[4].get(SELECT_METRIC, 0.0)):
                     best = (key, T, W, l2, m)
 
     best_key, best_T, best_W, best_l2, _ = best
-    print(f"\nBest Ridge by dev AUC vs teacher: {best_key} — refitting on all LM Studio data")
+    print(f"\nBest Ridge by {SELECT_METRIC}: {best_key} — refitting on all LM Studio data")
     p_best = np.array([get_target_score(r, best_T) for r in rows])
     
     w_best_all = np.ones(len(rows))
@@ -328,7 +432,7 @@ def main():
     w, b = train_ridge(X, p_best, best_l2, w_best_all)
     v = w / (np.linalg.norm(w) + 1e-9)
     final = evaluate(v, X[dev_idx], p_ref[dev_idx], X_val, val_internal,
-                     p_val_teacher, teacher_mask)
+                     p_val_teacher, teacher_mask, val_rel, val_external)
     print("Final model (trained on full data; dev metrics no longer held out):")
     for k_, v_ in final.items():
         print(f"  {k_}: {v_:.4f}")

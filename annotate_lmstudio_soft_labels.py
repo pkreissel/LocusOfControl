@@ -1,28 +1,167 @@
+import asyncio
 import json
 import os
 import time
 import numpy as np
-from openai import OpenAI
-from tqdm import tqdm
+from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
 
-from label_prompts import LETTER_TO_LABEL, get_teacher_prompt, prompt_version
+from label_prompts import LETTER_TO_LABEL, LETTER_TO_LABEL_ASSIST, get_teacher_prompt, prompt_version
 
 INPUT_FILE = os.environ.get("LOC_INPUT_FILE", "dataset_raw.jsonl")
 OUTPUT_FILE = os.environ.get("LOC_OUTPUT_FILE", "dataset_annotated_lmstudio_soft.jsonl")
-BATCH_SAVE = 10
-# Chosen model for psycholinguistic reasoning:
-MODEL_NAME = os.environ.get("LOC_TEACHER_MODEL", "tess-4-9b")
-TOP_LOGPROBS = int(os.environ.get("LOC_TOP_LOGPROBS", "15"))  # MLX models cap at 10
-TEMPERATURE = os.environ.get("LOC_TEMPERATURE")  # unset -> LM Studio default
-MAX_TOKENS = os.environ.get("LOC_MAX_TOKENS")  # unset -> no cap; guard against runaway reasoning
+API_BASE = os.environ.get("LOC_API_BASE", "http://localhost:8080/v1")
+MAX_CONCURRENT = int(os.environ.get("LOC_MAX_CONCURRENT", "4"))
+MODEL_NAME = os.environ.get("LOC_TEACHER_MODEL", "meta/muse-glimmer")
+TOP_LOGPROBS = int(os.environ.get("LOC_TOP_LOGPROBS", "10"))
+TEMPERATURE = float(os.environ.get("LOC_TEMPERATURE", "1.0"))
+TOP_P = float(os.environ.get("LOC_TOP_P", "0.95"))
 
-def main():
+async def annotate_post(client, post, sem, system_prompt):
+    async with sem:
+        try:
+            # We add a hint for controllable reasoning strength if supported by glimmer
+            messages = [
+                {"role": "system", "content": system_prompt + "\nReasoning Strength: high"},
+                {"role": "user", "content": f"Text: {post['text']}"}
+            ]
+            
+            completion = await client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=messages,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                logprobs=True,
+                top_logprobs=TOP_LOGPROBS,
+            )
+            
+            logprobs = completion.choices[0].logprobs
+            if logprobs is None or logprobs.content is None:
+                raise ValueError("Server returned empty logprobs.")
+                
+            logprobs_content = logprobs.content
+            
+            is_v4 = prompt_version() == "v4"
+            is_assist = prompt_version() == "assist"
+
+            def token_to_label(token):
+                t = token.strip().lower().replace(".", "").replace("\n", "")
+                if is_assist:
+                    return LETTER_TO_LABEL_ASSIST.get(t)
+                if is_v4 or prompt_version() in ["v2", "v3"]:
+                    return LETTER_TO_LABEL.get(t)
+                return t if t in ["internal", "external", "neutral"] else None
+
+            def token_to_level(token):
+                t = token.strip().replace(".", "").replace("\n", "")
+                if t in ["1", "2", "3"]:
+                    return int(t)
+                return None
+
+            def token_to_score(token):
+                t = token.strip().replace(".", "").replace("\n", "")
+                if t in [str(d) for d in range(10)]:
+                    return int(t)
+                return None
+
+            label_idx = None
+            level_idx = None
+            score_idx = None
+
+            # Output ends with (v3/v4/assist) Label/Level/Score. Scanning
+            # backward, v4's and assist's last digit is the Score, the next is the Level; v3 has
+            # only the Level digit.
+            for idx in range(len(logprobs_content) - 1, -1, -1):
+                tok = logprobs_content[idx].token
+                if (is_v4 or is_assist) and score_idx is None and token_to_score(tok) is not None:
+                    score_idx = idx
+                elif level_idx is None and token_to_level(tok) is not None:
+                    level_idx = idx
+                elif label_idx is None and token_to_label(tok) is not None:
+                    label_idx = idx
+                if label_idx is not None and level_idx is not None and (
+                    not (is_v4 or is_assist) or score_idx is not None
+                ):
+                    break
+
+            labels = ["helpful", "inert", "neutral"] if is_assist else ["internal", "external", "neutral"]
+            class_logprobs = {lbl: -20.0 for lbl in labels}
+            level_logprobs = {"1": -20.0, "2": -20.0, "3": -20.0}
+            score_logprobs = {str(d): -20.0 for d in range(10)}
+
+            if label_idx is not None:
+                decision_token_obj = logprobs_content[label_idx]
+                for item in decision_token_obj.top_logprobs:
+                    label = token_to_label(item.token)
+                    if label is not None:
+                        class_logprobs[label] = max(class_logprobs[label], item.logprob)
+                        
+            if level_idx is not None:
+                level_token_obj = logprobs_content[level_idx]
+                for item in level_token_obj.top_logprobs:
+                    level = token_to_level(item.token)
+                    if level is not None:
+                        level_logprobs[str(level)] = max(level_logprobs[str(level)], item.logprob)
+
+            if score_idx is not None:
+                score_token_obj = logprobs_content[score_idx]
+                for item in score_token_obj.top_logprobs:
+                    score = token_to_score(item.token)
+                    if score is not None:
+                        score_logprobs[str(score)] = max(score_logprobs[str(score)], item.logprob)
+
+            probs = {k: np.exp(v) for k, v in class_logprobs.items()}
+            total_prob = sum(probs.values())
+            if total_prob > 0:
+                normalized_probs = {k: (v / total_prob) for k, v in probs.items()}
+            else:
+                if is_assist:
+                    normalized_probs = {"helpful": 0.33, "inert": 0.33, "neutral": 0.34}
+                else:
+                    normalized_probs = {"internal": 0.33, "external": 0.33, "neutral": 0.34}
+                
+            level_probs = {k: np.exp(v) for k, v in level_logprobs.items()}
+            total_level_prob = sum(level_probs.values())
+            if total_level_prob > 0:
+                normalized_level_probs = {k: (v / total_level_prob) for k, v in level_probs.items()}
+            else:
+                normalized_level_probs = {"1": 1.0, "2": 0.0, "3": 0.0} # fallback
+                
+            post["soft_labels"] = [normalized_probs.get("internal",0), normalized_probs.get("external",0), normalized_probs.get("neutral",0)]
+            post['raw_logprobs'] = class_logprobs
+            post['loc_label'] = max(normalized_probs, key=normalized_probs.get)
+            
+            post['soft_levels'] = [normalized_level_probs["1"], normalized_level_probs["2"], normalized_level_probs["3"]]
+            post['level_logprobs'] = level_logprobs
+            post['loc_level'] = int(max(normalized_level_probs, key=normalized_level_probs.get))
+
+            # v4: graded 0-9 locus-of-control score. Expected value over the digit
+            # distribution (softmax of the raw digit logprobs, T=1) gives a smooth,
+            # high-resolution ranking target. loc_score_logprobs is stored raw so
+            # downstream can re-apply its own temperature (like raw_logprobs).
+            if score_idx is not None:
+                digits = np.array([score_logprobs[str(d)] for d in range(10)])
+                e = np.exp(digits - digits.max())
+                score_probs = e / e.sum()
+                post['loc_score_logprobs'] = score_logprobs
+                post['loc_score'] = float((score_probs * np.arange(10)).sum())
+            else:
+                post['loc_score_logprobs'] = None
+                post['loc_score'] = None
+
+            post['raw_response'] = completion.choices[0].message.content
+            
+            return post
+        except Exception as e:
+            tqdm.write(f"Error on post {post.get('uri')}: {e}")
+            return None
+
+async def main():
     if not os.path.exists(INPUT_FILE):
         print(f"{INPUT_FILE} not found. Please run the stream script first.")
         return
 
-    # Connect to local LM Studio instance
-    client = OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+    client = AsyncOpenAI(base_url=API_BASE, api_key="test-key")
 
     annotated_ids = set()
     if os.path.exists(OUTPUT_FILE):
@@ -36,94 +175,31 @@ def main():
         posts = [json.loads(line) for line in f]
 
     posts_to_annotate = [p for p in posts if p['uri'] not in annotated_ids]
-    print(f"{len(posts_to_annotate)} posts left to annotate.")
+    print(f"{len(posts_to_annotate)} posts left to annotate using {API_BASE} with max concurrency {MAX_CONCURRENT}...")
 
     if not posts_to_annotate:
         return
 
     system_prompt = get_teacher_prompt()
-    print(f"Using teacher prompt version: {prompt_version()}")
-
-    # v1 answers with a full word; v2 answers "Label: X" with a single letter so
-    # that all three classes reliably appear in top_logprobs (real soft labels).
-    def token_to_label(token):
-        t = token.strip().lower().replace(".", "").replace("\n", "")
-        if prompt_version() == "v2":
-            return LETTER_TO_LABEL.get(t)
-        return t if t in ["internal", "external", "neutral"] else None
-
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    
+    start_time = time.time()
+    
+    tasks = [annotate_post(client, p, sem, system_prompt) for p in posts_to_annotate]
+    
+    success_count = 0
     with open(OUTPUT_FILE, 'a') as f:
-        for i, post in enumerate(tqdm(posts_to_annotate, desc=f"Annotating via LM Studio ({MODEL_NAME})")):
-            try:
-                kwargs = {}
-                if TEMPERATURE is not None:
-                    kwargs["temperature"] = float(TEMPERATURE)
-                if MAX_TOKENS is not None:
-                    kwargs["max_tokens"] = int(MAX_TOKENS)
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Text: {post['text']}"}
-                    ],
-                    logprobs=True,
-                    top_logprobs=TOP_LOGPROBS,
-                    **kwargs
-                )
-                
-                logprobs = completion.choices[0].logprobs
-                if logprobs is None or logprobs.content is None:
-                    raise ValueError("LM Studio returned empty logprobs.")
-                logprobs_content = logprobs.content
-                
-                # Scan backwards to find the final classification token
-                target_idx = None
-                for idx in range(len(logprobs_content) - 1, -1, -1):
-                    if token_to_label(logprobs_content[idx].token) is not None:
-                        target_idx = idx
-                        break
-
-                class_logprobs = {"internal": -20.0, "external": -20.0, "neutral": -20.0}
-
-                if target_idx is not None:
-                    decision_token_obj = logprobs_content[target_idx]
-                    for item in decision_token_obj.top_logprobs:
-                        label = token_to_label(item.token)
-                        if label is not None:
-                            class_logprobs[label] = max(class_logprobs[label], item.logprob)
-                else:
-                    raise ValueError("Could not find strict label at end of generation.")
-                    
-                # Convert to normalized probabilities
-                probs = {k: np.exp(v) for k, v in class_logprobs.items()}
-                total_prob = sum(probs.values())
-                
-                if total_prob > 0:
-                    normalized_probs = {k: (v / total_prob) for k, v in probs.items()}
-                else:
-                    raise ValueError("Invalid logprobs (all zeros or extremely low).")
-                
-                probs_list = [
-                    normalized_probs["internal"], 
-                    normalized_probs["external"], 
-                    normalized_probs["neutral"]
-                ]
-                
-                post['soft_labels'] = probs_list
-                post['raw_logprobs'] = class_logprobs # Save raw logprobs so temperature scaling can be applied later
-                post['loc_label'] = max(normalized_probs, key=normalized_probs.get) # Best guess hard label for fallback
-                post['raw_response'] = completion.choices[0].message.content # Store reasoning for debugging
-                
-                f.write(json.dumps(post) + '\n')
-                
-                if i > 0 and i % BATCH_SAVE == 0:
-                    f.flush()
-                    
-            except Exception as e:
-                tqdm.write(f"\nAPI Error: {e}")
-                time.sleep(2)
-                
-    print("\nAnnotation complete.")
+        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"Annotating via {MODEL_NAME}"):
+            result = await fut
+            if result:
+                f.write(json.dumps(result) + '\n')
+                f.flush()
+                success_count += 1
+            
+    elapsed = time.time() - start_time
+    print(f"\nAnnotation complete. Successfully saved {success_count} posts to {OUTPUT_FILE}.")
+    if success_count > 0:
+        print(f"Total time for this batch: {elapsed:.2f} seconds ({success_count/elapsed:.2f} posts/sec)")
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
