@@ -5,8 +5,8 @@ from tqdm import tqdm
 import os
 import time
 
-# Connecting specifically to Jetstream to get app.bsky.feed.post creations
-JETSTREAM_URI = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post"
+# Connecting specifically to Jetstream to get app.bsky.feed.post and app.bsky.feed.like creations
+JETSTREAM_URI = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post&wantedCollections=app.bsky.feed.like"
 TARGET_POST_COUNT = 5000
 OUTPUT_FILE = "dataset_raw.jsonl"
 
@@ -46,6 +46,8 @@ async def stream_posts():
         print(f"Already reached the target of {TARGET_POST_COUNT} posts.")
         return
 
+    post_buffer = {} # uri -> post_data
+
     # We open in append mode in case of restarts
     with open(OUTPUT_FILE, 'a') as f:
         with tqdm(initial=collected_count, total=TARGET_POST_COUNT, desc="Collecting Posts") as pbar:
@@ -67,40 +69,60 @@ async def stream_posts():
                             if commit.get('operation') != 'create':
                                 continue
                                 
-                            did = data.get('did')
-                            if did not in network_dids:
-                                continue
-                                
+                            collection = commit.get('collection')
                             record = commit.get('record', {})
+                            did = data.get('did')
                             
-                            # Skip replies to only collect top-level posts
-                            if 'reply' in record:
-                                continue
+                            if collection == 'app.bsky.feed.post':
+                                # 1. Is this a reply? If so, check if it replies to a buffered post
+                                if 'reply' in record:
+                                    parent_uri = record['reply'].get('parent', {}).get('uri')
+                                    if parent_uri and parent_uri in post_buffer:
+                                        # The parent post got a reply! Save it.
+                                        f.write(json.dumps(post_buffer[parent_uri]) + '\n')
+                                        f.flush()
+                                        del post_buffer[parent_uri]
+                                        collected_count += 1
+                                        pbar.update(1)
+                                        if collected_count >= TARGET_POST_COUNT:
+                                            break
+                                            
+                                # 2. Process this post for the buffer (if it's a top-level post from our network)
+                                if did in network_dids and 'reply' not in record:
+                                    text = record.get('text', '').strip()
+                                    # Removed length caps and language filters as requested.
+                                    if len(text) > 0: 
+                                        uri = f"at://{did}/app.bsky.feed.post/{commit.get('rkey')}"
+                                        post_buffer[uri] = {
+                                            "did": did,
+                                            "uri": uri,
+                                            "text": text,
+                                            "createdAt": record.get('createdAt'),
+                                            "langs": record.get('langs', []),
+                                            "time_us": time_us
+                                        }
+                                        
+                                        # Periodically clean up old posts from the buffer to prevent memory leaks
+                                        # 10,000 items is a safe upper bound
+                                        if len(post_buffer) > 10000:
+                                            # Remove the oldest 10%
+                                            oldest_uris = list(post_buffer.keys())[:1000]
+                                            for old_uri in oldest_uris:
+                                                del post_buffer[old_uri]
 
-                            text = record.get('text', '').strip()
-                            
-                            # Filter out empty posts or very short ones (less than 15 chars might lack context for LoC)
-                            if len(text) < 15:
-                                continue
-                                
-                            post_data = {
-                                "did": did,
-                                "uri": f"at://{did}/app.bsky.feed.post/{commit.get('rkey')}",
-                                "text": text,
-                                "createdAt": record.get('createdAt'),
-                                "langs": record.get('langs', []),
-                                "time_us": time_us
-                            }
-                            
-                            f.write(json.dumps(post_data) + '\n')
-                            f.flush()
-                            
-                            collected_count += 1
-                            pbar.update(1)
-                            
-                            if collected_count >= TARGET_POST_COUNT:
-                                break
-                                
+                            elif collection == 'app.bsky.feed.like':
+                                # Check if it's a like on a buffered post
+                                subject_uri = record.get('subject', {}).get('uri')
+                                if subject_uri and subject_uri in post_buffer:
+                                    # The post got a like! Save it.
+                                    f.write(json.dumps(post_buffer[subject_uri]) + '\n')
+                                    f.flush()
+                                    del post_buffer[subject_uri]
+                                    collected_count += 1
+                                    pbar.update(1)
+                                    if collected_count >= TARGET_POST_COUNT:
+                                        break
+                                        
                 except websockets.exceptions.ConnectionClosed:
                     print("\nConnection closed by server. Reconnecting in 5 seconds...")
                     await asyncio.sleep(5)
