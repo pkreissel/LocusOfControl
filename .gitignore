@@ -28,3 +28,19 @@ nohup.out
 # Bunny edge worker
 bunny_feed/node_modules/
 bunny_feed/dist/
+
+# Fine-tuned reranker checkpoints (tens of GB, retrain via train_jina_reranker.py)
+loc-reranker-*/
+
+# Per-experiment vector sidecars (the .npy they calibrate is ignored too).
+# The two committed ones describe the vectors that ship, so keep them.
+*_vector_*_meta.json
+external_vector_meta.json
+!internal_vector_meta.json
+!internal_vector_bonsai_v2_meta.json
+
+# Snapshots of previous runs kept for A/B comparison
+*.prev.json
+old_vector.json
+old_metrics.txt
+reposts_analysis.json
