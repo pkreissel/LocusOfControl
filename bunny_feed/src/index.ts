@@ -443,7 +443,12 @@ async function handleRequest(request: Request): Promise<Response> {
           ],
           infill: 'popularity',
           user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
-          num_candidates: 500
+          num_candidates: 500,
+          // Restrict candidates to the last 3 days. GE's allowed values are
+          // 6/12/24/48/72/168; the infill generator inherits this window too,
+          // so it can't widen eligibility. Smaller pool → may lower yield
+          // past the 0.55 vector filter; raise num_candidates if feed runs short.
+          max_age_hours: 72
         };
         // Only send the key when non-empty so the unauthenticated path stays
         // byte-identical to before and we never send an empty array.
