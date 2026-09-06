@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, index } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
 
 export const embeddingUsage = sqliteTable('embedding_usage', {
@@ -8,12 +8,16 @@ export const embeddingUsage = sqliteTable('embedding_usage', {
   updatedAt: text('updated_at').default(sql`CURRENT_TIMESTAMP`),
 });
 
-// Cache of per-post embedding vectors, keyed by AT-URI. Stored in the DB (not
-// the per-PoP edge cache) so a vector computed at one edge location is reused
-// globally, and so reads/writes batch into a single round-trip. `model` scopes
-// entries to the embedding model that produced them (a retrain invalidates old
-// rows via a cache miss). `vec` is the float array as JSON text. Pruned
-// opportunistically by `createdAt`.
+// DEPRECATED: superseded by `postScores` below and no longer read or written by
+// the feed. Kept declared so the one-off migrate_db.ts helper still compiles and
+// so the existing table isn't implicitly dropped; safe to remove (along with the
+// table) once the live DB has been cleaned up.
+//
+// Cache of per-post embedding vectors, keyed by AT-URI. Storing the full 1024-dim
+// vector as JSON text cost ~11.6 KB per row, so a 500-candidate lookup moved
+// ~5.9 MB and took ~9s — slower than simply re-embedding all 500 from scratch
+// (~6.5s). The vector was only ever consumed to compute one scalar, so the cache
+// could never pay off in latency; `postScores` caches that scalar instead.
 export const postEmbeddings = sqliteTable('post_embeddings', {
   uri: text('uri').primaryKey(),
   vec: text('vec').notNull(),
@@ -23,6 +27,30 @@ export const postEmbeddings = sqliteTable('post_embeddings', {
   // Serves the opportunistic prune (WHERE created_at < cutoff), which otherwise
   // full-scans. created_at is monotonic, so inserts append to the index edge.
   index('post_embeddings_created_at_idx').on(t.createdAt),
+]);
+
+// Cache of per-post *scores*, keyed by AT-URI — the feed's embedding cache.
+//
+// A candidate's embedding is used for exactly one thing: scoreEmbedding() folds
+// it against the trained vector into a single probability, which becomes the
+// candidate's rank `score`. The vector itself is never used again, so caching it
+// (see the deprecated postEmbeddings above) shipped ~11.6 KB per post across the
+// wire to recompute one float. This table stores that float: ~1500x less payload,
+// which turns a ~9s cached read into ~50ms and makes the cache an actual latency
+// win rather than a cost-only one.
+//
+// `version` scopes entries to BOTH the embedding model and the scoring vector
+// (`${EMBEDDING_MODEL}:${VECTOR_VERSION}`), so changing either one invalidates
+// old rows via an ordinary cache miss. Pruned opportunistically by `createdAt`.
+export const postScores = sqliteTable('post_scores', {
+  uri: text('uri').primaryKey(),
+  score: real('score').notNull(),              // sigmoid probability from scoreEmbedding()
+  version: text('version').notNull(),          // embedding model + scoring-vector fingerprint
+  createdAt: integer('created_at').notNull(),  // unix ms, for the prune
+}, (t) => [
+  // Serves the opportunistic prune (WHERE created_at < cutoff), which otherwise
+  // full-scans. created_at is monotonic, so inserts append to the index edge.
+  index('post_scores_created_at_idx').on(t.createdAt),
 ]);
 
 // Frozen ranked list for one scroll session, so cursor pagination pages through

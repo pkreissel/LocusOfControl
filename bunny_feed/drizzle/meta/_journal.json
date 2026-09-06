@@ -15,6 +15,13 @@
       "when": 1787575111114,
       "tag": "0001_feed_sessions_did_created_at_idx",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788697626275,
+      "tag": "0002_cheerful_captain_universe",
+      "breakpoints": true
     }
   ]
 }

@@ -25,3 +25,34 @@ export function scoreEmbedding(embedding: number[]): { cosine: number, probabili
   const probability = 1.0 / (1.0 + Math.exp(-(SCALE * cos + BIAS)));
   return { cosine: cos, probability };
 }
+
+// --- Scoring-model fingerprint --------------------------------------------
+//
+// The feed caches the *score* each post gets (see post_scores), not the 1024-dim
+// embedding it was derived from. That makes the cache key depend on the scoring
+// model too: regenerating vector.json (export_vector_json.py, after a retrain)
+// must invalidate every cached score, or the feed would keep serving the old
+// model's verdicts forever.
+//
+// So we hash the raw parameters — weights, scale, bias — once per isolate and
+// fold the result into the cache key. A retrain changes the hash, which changes
+// the key, which turns every stale row into an ordinary cache miss. FNV-1a over
+// each float's exact bit pattern; we only need "did this change?", so collision
+// resistance is irrelevant. Note VECTOR_PROB_THRESHOLD is deliberately NOT part
+// of this: it is applied to the cached score at read time, so retuning the
+// threshold costs nothing and keeps the warm cache.
+const _f32 = new Float32Array(1);
+const _u8 = new Uint8Array(_f32.buffer);
+function fingerprint(nums: number[]): string {
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < nums.length; i++) {
+    _f32[0] = nums[i];
+    for (let b = 0; b < 4; b++) {
+      h = (h ^ _u8[b]) >>> 0;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+export const VECTOR_VERSION = fingerprint([...targetVector, SCALE, BIAS]);

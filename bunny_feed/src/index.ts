@@ -1,7 +1,7 @@
 import { jwtDecode } from 'jwt-decode';
-import { getEmbeddings, EMBEDDING_MODEL } from './jina';
-import { scoreEmbedding } from './vector';
-import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedEmbeddings, putEmbeddings, pruneOldEmbeddings, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
+import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
+import { scoreEmbedding, VECTOR_VERSION } from './vector';
+import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
 console.log("Bunny Edge Script module initialized");
@@ -44,9 +44,18 @@ declare const Bunny: any;
 // (local/test) there is no isolate to keep alive, so the already-running promise
 // is simply left to complete unawaited.
 function runAfterResponse(promise: Promise<unknown>): void {
-  if (typeof Bunny !== 'undefined' && Bunny.v1?.waitUntil) {
+  if (hasWaitUntil()) {
     Bunny.v1.waitUntil(promise);
   }
+}
+
+// Whether this runtime actually provides waitUntil. The SDK ships no typings for
+// it (we reach for the `Bunny` global directly), so "is it there?" is only
+// answerable at runtime — and every deferred write silently becomes a no-op if it
+// isn't. Surfaced on the response as X-Wait-Until so a single curl confirms it on
+// the live deployment, rather than inferring it from missing rows days later.
+function hasWaitUntil(): boolean {
+  return typeof Bunny !== 'undefined' && typeof Bunny.v1?.waitUntil === 'function';
 }
 
 function getEnv(key: string): string | undefined {
@@ -87,12 +96,16 @@ function cursorTag(c?: string): string {
   return !c ? 'START' : (c.length > 12 ? c.slice(0, 12) + '…' : c);
 }
 
-// Prune embedding-cache rows older than this. Vectors for posts that stop
-// appearing in feeds age out; a still-relevant post is simply re-embedded once.
-const EMBED_CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+// Prune score-cache rows older than this. Candidate generation asks GE for
+// max_age_hours: 72, so a post older than 3 days can never be a candidate again
+// and its cached score can never be hit — retention only has to cover that
+// window plus a margin for clock skew and for the window being widened. The old
+// 30-day retention was ~10x wider than reachable, so ~90% of the table was rows
+// that could only ever be scanned past, never read.
+const SCORE_CACHE_MAX_AGE_MS = 4 * 24 * 60 * 60 * 1000; // 4 days
 // Fraction of feed requests that opportunistically prune stale cache rows,
 // keeping the table bounded without a separate cron.
-const EMBED_PRUNE_PROBABILITY = 0.02;
+const SCORE_PRUNE_PROBABILITY = 0.02;
 
 // Seen-post exclusion. On each personalized cache miss we pull the user's
 // most-recently-shown posts and hand them to candidate generation as
@@ -168,26 +181,49 @@ async function safeCachePut(cache: Cache, key: string, res: Response): Promise<v
   }
 }
 
-// Embed candidates, reusing vectors cached in the DB and only sending cache
-// misses to Jina. Returns embeddings aligned to `cands` and the tokens actually
-// billed (misses only). Reads are a single batched SELECT and writes a single
-// batched upsert, and the cache is shared globally across edge PoPs.
-async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ embeddings: number[][]; tokens: number }> {
-  const embeddings: number[][] = new Array(cands.length);
+// Score candidates, reusing scores cached in the DB and only sending cache
+// misses to Jina. Returns scores aligned to `cands` (null where scoring failed)
+// plus the tokens actually billed (misses only) and cache/fan-out counters for
+// diagnostics.
+//
+// The cache stores the *score*, not the embedding: the 1024-dim vector is used
+// once, to compute this scalar, and never again. Caching the vector meant moving
+// ~11.6 KB per post, so a full 500-candidate cache hit read ~5.9 MB and took ~9s
+// — slower than re-embedding all 500 from scratch (~6.5s), which made the cache
+// a cost optimization that actively hurt latency. Caching the scalar cuts the
+// same read to ~15 KB.
+//
+// SCORE_CACHE_VERSION scopes entries to the embedding model AND the scoring
+// vector, so retraining either invalidates old rows by simple cache miss.
+const SCORE_CACHE_VERSION = `${EMBEDDING_MODEL}:${VECTOR_VERSION}`;
 
-  // Batch-load cached vectors. Best-effort: a DB error just means "all miss".
-  const cached = await getCachedEmbeddings(cands.map(c => c.uri), EMBEDDING_MODEL)
-    .catch((e: any) => { console.error("[embed cache] read failed:", errChain(e)); return new Map<string, number[]>(); });
+type ScoreResult = {
+  scores: (number | null)[];
+  tokens: number;
+  hits: number;
+  misses: number;
+  chunks: number;
+  failedChunks: number;
+};
+
+async function scoreCandidates(cands: Candidate[], apiKey: string): Promise<ScoreResult> {
+  const scores: (number | null)[] = new Array(cands.length).fill(null);
+
+  // Batch-load cached scores. Best-effort: a DB error just means "all miss".
+  const cached = await getCachedScores(cands.map(c => c.uri), SCORE_CACHE_VERSION)
+    .catch((e: any) => { console.error("[score cache] read failed:", errChain(e)); return new Map<string, number>(); });
 
   // De-duplicate misses by uri: Jina is billed per unique text, and SQLite
   // rejects upserting the same row twice in one statement.
   const missSlot = new Map<string, number>(); // uri -> index into miss arrays
   const missUris: string[] = [];
   const missTexts: string[] = [];
+  let hits = 0;
   for (let i = 0; i < cands.length; i++) {
     const hit = cached.get(cands[i].uri);
-    if (hit) {
-      embeddings[i] = hit;
+    if (hit !== undefined) {
+      scores[i] = hit;
+      hits++;
     } else if (!missSlot.has(cands[i].uri)) {
       missSlot.set(cands[i].uri, missUris.length);
       missUris.push(cands[i].uri);
@@ -195,34 +231,62 @@ async function embedCandidates(cands: Candidate[], apiKey: string): Promise<{ em
     }
   }
 
-  let tokens = 0;
+  let tokens = 0, chunks = 0, failedChunks = 0;
   if (missUris.length > 0) {
-    const res = await getEmbeddings(missTexts, apiKey);
+    // getEmbeddingsBatched throws only when EVERY chunk failed (a total Jina
+    // outage). Now that the cache is load-bearing we can ride that out: if some
+    // candidates were served from cache, rank those instead of failing the whole
+    // request. With no hits either there is nothing to serve, so rethrow and let
+    // the handler return its 500 as before.
+    let res: Awaited<ReturnType<typeof getEmbeddingsBatched>>;
+    try {
+      res = await getEmbeddingsBatched(missTexts, apiKey);
+    } catch (e: any) {
+      if (hits === 0) throw e;
+      console.error(`[score cache] all Jina chunks failed; serving ${hits} cached score(s) only:`, e?.message ?? String(e));
+      return { scores, tokens: 0, hits, misses: missUris.length, chunks: 0, failedChunks: 0 };
+    }
     tokens = res.tokens;
+    chunks = res.chunks;
+    failedChunks = res.failedChunks;
+
+    // Fold each fresh embedding down to its score. A null embedding means that
+    // Jina chunk failed; the candidate stays unscored and drops out of the feed.
+    const missScores: (number | null)[] = res.embeddings.map(e => (e ? scoreEmbedding(e).probability : null));
 
     // Fill every still-empty slot (including duplicate uris) from the results.
     for (let i = 0; i < cands.length; i++) {
-      if (!embeddings[i]) embeddings[i] = res.embeddings[missSlot.get(cands[i].uri)!];
+      if (scores[i] === null) {
+        const slot = missSlot.get(cands[i].uri);
+        if (slot !== undefined) scores[i] = missScores[slot];
+      }
     }
 
-    // One batched upsert of the freshly-computed vectors.
-    const toStore = missUris.map((uri, k) => ({ uri, vec: res.embeddings[k] }));
-    runAfterResponse(
-      putEmbeddings(toStore, EMBEDDING_MODEL)
-        .catch((e: any) => console.error("[embed cache] write failed:", errChain(e)))
-    );
+    // Persist the freshly-computed scores. Awaited rather than deferred past the
+    // response: the vector version of this write was 5 sequential ~1.2 MB upserts,
+    // which is why it was moved behind waitUntil — but the score payload is ~1500x
+    // smaller (one ~50 KB statement), so a single inline round-trip costs ~30ms on
+    // a multi-second request. That buys certainty: the cache warming is the entire
+    // point of this path, and a deferred write that silently fails would leave the
+    // cache permanently cold with no signal. Prunes and telemetry, which nothing
+    // depends on, still go through runAfterResponse.
+    const toStore = missUris
+      .map((uri, k) => ({ uri, score: missScores[k] }))
+      .filter((e): e is { uri: string; score: number } => e.score !== null);
+    await putScores(toStore, SCORE_CACHE_VERSION)
+      .catch((e: any) => console.error("[score cache] write failed:", errChain(e)));
   }
 
   // Opportunistically keep the table bounded. Deferred past the response via
   // waitUntil so the prune never adds latency to the request.
-  if (Math.random() < EMBED_PRUNE_PROBABILITY) {
+  if (Math.random() < SCORE_PRUNE_PROBABILITY) {
     runAfterResponse(
-      pruneOldEmbeddings(Date.now() - EMBED_CACHE_MAX_AGE_MS)
-        .catch((e: any) => console.error("[embed cache] prune failed:", errChain(e)))
+      pruneOldScores(Date.now() - SCORE_CACHE_MAX_AGE_MS)
+        .catch((e: any) => console.error("[score cache] prune failed:", errChain(e)))
     );
   }
 
-  return { embeddings, tokens };
+  return { scores, tokens, hits, misses: missUris.length, chunks, failedChunks };
 }
 
 BunnySDK.net.http.serve(async (request: Request) => {
@@ -355,7 +419,7 @@ async function handleRequest(request: Request): Promise<Response> {
               // Never let the PullZone CDN cache the personalized skeleton (keys on
               // neither cursor nor DID). Our own per-key stores handle caching.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'pagination-1',
+              'X-Feed-Version': 'score-cache-1',
             },
           });
         }
@@ -391,7 +455,7 @@ async function handleRequest(request: Request): Promise<Response> {
               // Same reasoning as the other personalized paths: keep the PullZone
               // CDN out of it; our per-user session store already caches.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'pagination-1',
+              'X-Feed-Version': 'score-cache-1',
             },
           });
         }
@@ -413,6 +477,9 @@ async function handleRequest(request: Request): Promise<Response> {
       // doesn't repeat them. Best-effort: a DB failure just means no exclusion
       // this request. Only meaningful when we know who the user is.
       let tSeen = 0, tPrune = 0, tCand = 0, tEmbed = 0, tRank = 0, tStore = 0;
+      // Score-cache diagnostics, surfaced in the [feed] log line and on the
+      // response headers so cache warming can be verified without DB access.
+      let embedHits = 0, embedMisses = 0, embedChunks = 0, embedFailedChunks = 0;
       let tS_start = Date.now();
       let excludeUris: string[] = [];
       if (userDid) {
@@ -477,19 +544,27 @@ async function handleRequest(request: Request): Promise<Response> {
 
       if (candidates.length > 0) {
         const tE_start = Date.now();
-        // (3) Reuse cached vectors; only cache-missed posts are sent to Jina.
-        const { embeddings, tokens } = await embedCandidates(candidates, apiKey);
-        // Best-effort cost tracking; never let it break the feed response.
-        await recordEmbeddingUsage(tokens).catch((e: any) =>
-          console.error("[getFeedSkeleton] failed to record token usage:", e?.cause?.message || e?.message));
-        
+        // (3) Reuse cached scores; only cache-missed posts are sent to Jina.
+        const scored = await scoreCandidates(candidates, apiKey);
+        embedHits = scored.hits;
+        embedMisses = scored.misses;
+        embedChunks = scored.chunks;
+        embedFailedChunks = scored.failedChunks;
+        // Best-effort cost tracking. Deferred past the response via waitUntil:
+        // nothing in the request depends on it, and awaiting it put a full DB
+        // round-trip on the hot path purely for daily token accounting.
+        runAfterResponse(
+          recordEmbeddingUsage(scored.tokens).catch((e: any) =>
+            console.error("[getFeedSkeleton] failed to record token usage:", errChain(e)))
+        );
+
         for (let i = 0; i < candidates.length; i++) {
-          const score = scoreEmbedding(embeddings[i]);
-          if (score.probability >= VECTOR_PROB_THRESHOLD) {
+          const p = scored.scores[i];
+          if (p !== null && p >= VECTOR_PROB_THRESHOLD) {
             // Overwrite the generator's popularity `score` (unused after ranking)
             // with the vector-similarity probability so GE's `candidate_score`
             // model can blend it into the final rank order (see RANK_SIM_WEIGHT).
-            candidates[i].score = score.probability;
+            candidates[i].score = p;
             filteredCandidates.push(candidates[i]);
           }
         }
@@ -609,7 +684,10 @@ async function handleRequest(request: Request): Promise<Response> {
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
-        tSeen, tPrune, tCand, tEmbed, tRank, tStore
+        tSeen, tPrune, tCand, tEmbed, tRank, tStore,
+        cacheHit: embedHits, cacheMiss: embedMisses,
+        jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
+        waitUntil: hasWaitUntil() ? 'y' : 'n'
       });
 
       return new Response(JSON.stringify(body), {
@@ -626,9 +704,16 @@ async function handleRequest(request: Request): Promise<Response> {
           // X-Feed-Version confirms which build is actually serving traffic;
           // X-Ranked-Count is the full frozen list length; X-Exclude-Count reports
           // how many seen-post URIs were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'pagination-1',
+          'X-Feed-Version': 'score-cache-1',
           'X-Ranked-Count': String(rankedUris.length),
           'X-Exclude-Count': String(excludeUris.length),
+          // Score-cache diagnostics: hits/misses tell you whether the cache is warming
+          // at all, and jina=<chunks> how far the miss batch fanned out. A warm
+          // feed shows m=0 (or only genuinely new posts) on a repeat request.
+          'X-Score-Cache': `h=${embedHits} m=${embedMisses} jina=${embedChunks}${embedFailedChunks ? ` fail=${embedFailedChunks}` : ''}`,
+          // Whether deferred (post-response) work is actually supported here; if
+          // this reads 'n', prunes and token accounting are silently no-ops.
+          'X-Wait-Until': hasWaitUntil() ? 'y' : 'n',
         },
       });
     } catch (e: any) {

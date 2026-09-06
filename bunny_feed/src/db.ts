@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
-import { embeddingUsage, feedInteractions, feedSessions, postEmbeddings } from './schema';
+import { embeddingUsage, feedInteractions, feedSessions, postScores } from './schema';
 import { sql, and, eq, lt, gte, inArray, desc, isNotNull } from 'drizzle-orm';
 
 declare const process: any;
@@ -198,67 +198,75 @@ export async function recordEmbeddingUsage(tokens: number) {
     });
 }
 
-// --- Embedding vector cache ----------------------------------------------
+// --- Score cache ----------------------------------------------------------
 //
-// Read/write per-post vectors in single batched round-trips (one SELECT ... IN
-// for reads, one multi-row upsert for writes) instead of N per-key edge-cache
-// ops. Stored globally in the DB so vectors are shared across all edge PoPs.
+// Per-post scores (not embeddings) in single batched round-trips, stored in the
+// DB rather than the per-PoP edge cache so a score computed at one edge location
+// is reused globally. See the postScores comment in schema.ts for why we cache
+// the scalar instead of the 1024-dim vector it came from.
+//
+// Chunking is bound by SQLite's per-statement variable limit (~999), not by
+// payload: a score row is a handful of bytes, so a 200-uri read now moves ~4 KB
+// where the old vector read moved ~2.4 MB. Reads run concurrently because the
+// cost is round-trip latency, not bandwidth; writes stay sequential to avoid
+// piling concurrent write statements onto the same SQLite file.
+const SCORE_READ_CHUNK = 200;   // 200 uris + 1 version = 201 bound params
+const SCORE_WRITE_CHUNK = 200;  // 200 rows x 4 columns = 800 bound params
 
-// Fetch cached vectors for `uris` produced by `model`. Returns a uri -> vector
-// map containing only the hits; misses are simply absent.
-export async function getCachedEmbeddings(uris: string[], model: string): Promise<Map<string, number[]>> {
-  const out = new Map<string, number[]>();
+// Fetch cached scores for `uris` under `version`. Returns a uri -> score map
+// containing only the hits; misses are simply absent.
+export async function getCachedScores(uris: string[], version: string): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
   if (uris.length === 0) return out;
   const db = getDbClient();
-  // Chunk only to stay well under SQLite's bound-parameter limit. Response size
-  // is not a concern (Turso happily returns multi-MB result sets), and transient
-  // failures are handled by the driver's retry, so keep chunks large to minimise
-  // round-trips.
-  const CHUNK_SIZE = 100;
-  for (let i = 0; i < uris.length; i += CHUNK_SIZE) {
-    const chunk = uris.slice(i, i + CHUNK_SIZE);
-    const rows = await db
-      .select({ uri: postEmbeddings.uri, vec: postEmbeddings.vec })
-      .from(postEmbeddings)
-      .where(and(inArray(postEmbeddings.uri, chunk), eq(postEmbeddings.model, model)));
-    for (const r of rows as { uri: string; vec: string }[]) {
-      try { out.set(r.uri, JSON.parse(r.vec)); } catch { /* skip corrupt row */ }
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < uris.length; i += SCORE_READ_CHUNK) chunks.push(uris.slice(i, i + SCORE_READ_CHUNK));
+
+  // Concurrent: at most ceil(500/200) = 3 statements, well under the ~8 in-flight
+  // ceiling that Bunny's runtime handles reliably.
+  const results = await Promise.all(chunks.map(chunk =>
+    db.select({ uri: postScores.uri, score: postScores.score })
+      .from(postScores)
+      .where(and(inArray(postScores.uri, chunk), eq(postScores.version, version)))
+  ));
+
+  for (const rows of results) {
+    for (const r of rows as { uri: string; score: number }[]) {
+      if (typeof r.score === 'number' && Number.isFinite(r.score)) out.set(r.uri, r.score);
     }
   }
   return out;
 }
 
-// Upsert freshly-computed vectors in a single multi-row statement. `entries`
-// must be de-duplicated by uri (SQLite rejects updating the same row twice in
-// one statement).
-export async function putEmbeddings(entries: { uri: string; vec: number[] }[], model: string): Promise<void> {
+// Upsert freshly-computed scores. `entries` must be de-duplicated by uri (SQLite
+// rejects updating the same row twice in one statement).
+export async function putScores(entries: { uri: string; score: number }[], version: string): Promise<void> {
   if (entries.length === 0) return;
   const db = getDbClient();
   const now = Date.now();
-  const CHUNK_SIZE = 100;
-  for (let i = 0; i < entries.length; i += CHUNK_SIZE) {
-    const chunk = entries.slice(i, i + CHUNK_SIZE);
-    await db.insert(postEmbeddings)
-      .values(chunk.map(e => ({ uri: e.uri, vec: JSON.stringify(e.vec), model, createdAt: now })))
+  for (let i = 0; i < entries.length; i += SCORE_WRITE_CHUNK) {
+    const chunk = entries.slice(i, i + SCORE_WRITE_CHUNK);
+    await db.insert(postScores)
+      .values(chunk.map(e => ({ uri: e.uri, score: e.score, version, createdAt: now })))
       .onConflictDoUpdate({
-        target: postEmbeddings.uri,
-        set: { vec: sql`excluded.vec`, model: sql`excluded.model`, createdAt: sql`excluded.created_at` },
+        target: postScores.uri,
+        set: { score: sql`excluded.score`, version: sql`excluded.version`, createdAt: sql`excluded.created_at` },
       });
   }
 }
 
-// Delete cached vectors older than `cutoffTs` (unix ms). Called opportunistically
+// Delete cached scores older than `cutoffTs` (unix ms). Called opportunistically
 // to keep the table bounded.
-export async function pruneOldEmbeddings(cutoffTs: number): Promise<void> {
+export async function pruneOldScores(cutoffTs: number): Promise<void> {
   const db = getDbClient();
-  const toDelete = db.select({ uri: postEmbeddings.uri })
-    .from(postEmbeddings)
-    .where(lt(postEmbeddings.createdAt, cutoffTs))
+  const toDelete = db.select({ uri: postScores.uri })
+    .from(postScores)
+    .where(lt(postScores.createdAt, cutoffTs))
     .limit(1000);
-  await db.delete(postEmbeddings).where(inArray(postEmbeddings.uri, toDelete));
+  await db.delete(postScores).where(inArray(postScores.uri, toDelete));
 }
 
-// --- Cursor-pagination session store -------------------------------------
 //
 // A scroll session's frozen ranked URI list. Page 1 stores the full ranked list
 // here; later pages read it back and slice a window, so pagination never re-runs
