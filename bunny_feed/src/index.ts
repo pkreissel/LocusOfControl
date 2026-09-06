@@ -18,8 +18,22 @@ function errChain(e: any): string {
   return parts.join(' <- ');
 }
 
-// Based on real data distribution, probabilities have shifted. 0.55 passes ~50%, 0.60 passes ~25%.
-const VECTOR_PROB_THRESHOLD = 0.55;
+// Recalibrated for the vector retrained in 4a9286e, which shifted the score
+// distribution up: its cosines span roughly -0.22..+0.25, so with scale 6.542 /
+// bias 1.807 nothing scores below ~0.59 and the old 0.55 rejected *nothing* —
+// measured over 17.5k dataset texts and 993 live two-tower candidates alike.
+//
+// 0.88 restores the "passes ~50%" intent the old constant was tuned for: it
+// keeps 47% of corpus texts and 34% of live candidates (~172 of 500, still
+// clear of MAX_RERANK_CANDIDATES). On the held-out validation set it keeps 76%
+// of internal posts against 26% of external ones. Going to 0.90 sharpens that
+// to 54%/12% but leaves only ~104 live candidates, which would starve the
+// reranker — raise num_candidates first if you want that operating point.
+//
+// NB this constant tracks the vector: any retrain moves the distribution and
+// must move this number with it (a percentile calibrated at export time would
+// be sturdier than a hard-coded probability).
+const VECTOR_PROB_THRESHOLD = 0.88;
 
 // Maximum number of candidates to send to the final GE reranker (rank/predict)
 const MAX_RERANK_CANDIDATES = 100;
