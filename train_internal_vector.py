@@ -8,7 +8,8 @@ rescaled to the same [0,9] axis. See get_target_score / get_expected_score.
 
 Outputs internal_vector.npy (best model) and results_internal_vector.json.
 
-Run: uv run --with numpy --with scipy --with scikit-learn python train_internal_vector.py
+Run: uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers \
+     --with einops --with peft --with tqdm python train_internal_vector.py
 """
 
 import json
@@ -21,12 +22,14 @@ from sklearn.metrics import average_precision_score, ndcg_score, roc_auc_score
 
 # Overridable to train on a different teacher dataset (see README):
 LMSTUDIO_FILE = os.environ.get("LOC_TEACHER_FILE", "dataset_annotated_lmstudio_soft.jsonl")
-GEMINI_FILE = "dataset_validation_gemini.jsonl"  # defines validation posts + embedding row order
+# Validation posts + embedding row order. Override for a different axis: the assist
+# pipeline points these at its own Gemini-labelled set (helpful/inert/neutral).
+GEMINI_FILE = os.environ.get("LOC_VAL_FILE", "dataset_validation_gemini.jsonl")
 VAL_LABELS_FILE = os.environ.get("LOC_VAL_LABELS_FILE")  # optional uri->loc_label override
 INTERACTIONS_FILE = "dataset_interactions.jsonl"
 CACHE_LMSTUDIO_EMBS = os.environ.get("LOC_EMB_CACHE", "embeddings_lmstudio_soft_v3_jina.npz") # Updated cache name for v3
 CACHE_INTERACTIONS_EMBS = "embeddings_interactions_jina.npz"
-CACHE_GEMINI_EMBS = "embeddings_gemini_jina.npz"
+CACHE_GEMINI_EMBS = os.environ.get("LOC_VAL_EMB_CACHE", "embeddings_gemini_jina.npz")
 VECTOR_OUT = os.environ.get("LOC_VECTOR_OUT", "internal_vector.npy")
 EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small"
 
@@ -37,6 +40,11 @@ if _PROMPT_VER == "assist":
     LABEL_MAP = {"helpful": 0, "inert": 1, "neutral": 2}
     POSITIVE_LABEL = "helpful"
     NEGATIVE_LABEL = "inert"
+elif _PROMPT_VER == "virtue":
+    VALID_LABELS = ["virtuous", "dogmatic", "neutral"]
+    LABEL_MAP = {"virtuous": 0, "dogmatic": 1, "neutral": 2}
+    POSITIVE_LABEL = "virtuous"
+    NEGATIVE_LABEL = "dogmatic"
 else:
     VALID_LABELS = ["internal", "external", "neutral"]
     LABEL_MAP = {"internal": 0, "external": 1, "neutral": 2}
@@ -122,10 +130,12 @@ if os.environ.get("LOC_USE_LOC_SCORE", "1") == "0":
 
 
 def get_class(r, temperature):
-    """internal / external / neutral for a row: hard loc_label for interactions,
-    else argmax of the teacher's raw_logprobs."""
-    if r.get("is_interaction") and r.get("loc_label") in VALID_LABELS:
-        return r["loc_label"]
+    """internal / external / neutral for a row: argmax of the teacher's raw_logprobs.
+
+    Interaction rows are no deliberate exception: a like or a requestLess decides
+    which posts enter the training set (and is logged when it disagrees), but the
+    target itself comes purely from the teacher, exactly as for every other row.
+    """
     lp = r.get("raw_logprobs")
     if lp:
         a = np.array([lp.get(l, -20.0) for l in VALID_LABELS]) / temperature
@@ -133,15 +143,26 @@ def get_class(r, temperature):
     return r.get("loc_label") if r.get("loc_label") in VALID_LABELS else "neutral"
 
 
+# The positive band runs 6-9; the level fallback below already lands in it.
+POSITIVE_BAND = (6.0, 9.0)
+# How far below the band a positive-labelled row must score before it counts as
+# the teacher contradicting itself rather than float noise.
+CONTRADICTION_MARGIN = 0.5
+
+
 def get_positive_intensity(r, temperature):
-    """0-9 intensity for an internal post: smooth v4 loc_score when available,
-    else mapped from the 3-level concreteness rubric (1->6, 2->7.5, 3->9)."""
+    """0-9 intensity for a positive post: smooth v4 loc_score when available,
+    else mapped from the 3-level concreteness rubric (1->6, 2->7.5, 3->9).
+
+    Bounded above by the band, but a low score is returned as-is: it is a real
+    signal that the teacher's own label is wrong, and get_target_score acts on it.
+    """
     s = get_expected_score(r, temperature)
-    if s is not None:
-        return s
-    if r.get("loc_score") is not None:
-        return float(r["loc_score"])
-    return 6.0 + 1.5 * (get_expected_level(r, temperature) - 1.0)
+    if s is None and r.get("loc_score") is not None:
+        s = float(r["loc_score"])
+    if s is None:
+        s = 6.0 + 1.5 * (get_expected_level(r, temperature) - 1.0)
+    return min(s, POSITIVE_BAND[1])
 
 
 def get_target_score(r, temperature):
@@ -157,7 +178,19 @@ def get_target_score(r, temperature):
     # band (default): NEGATIVE_LABEL -> 0, neutral -> NEU_BAND, POSITIVE_LABEL -> intensity (6-9)
     c = get_class(r, temperature)
     if c == POSITIVE_LABEL:
-        return get_positive_intensity(r, temperature)
+        s = get_positive_intensity(r, temperature)
+        # The score is an expected value over the digit distribution, so a one-hot
+        # 6 arrives as 5.999999996; compare with a margin and snap back to the band
+        # floor, or float noise alone would demote a well-formed row.
+        if s >= POSITIVE_BAND[0] - CONTRADICTION_MARGIN:
+            return max(s, POSITIVE_BAND[0])
+        # The teacher contradicted itself: the label token says positive, its own
+        # graded score says the post is not. Measured on the assist axis, the score
+        # is the trustworthy half of that pair - it never promotes a negative row
+        # (0 of 256 non-positive rows scored >=6) but it does correctly demote
+        # rhetorical questions that drew a positive label (5 of 14). So band the
+        # row by the score the teacher gave it rather than by the label it wrote.
+        return NEU_BAND if s >= 2.0 else 0.0
     if c == "neutral":
         return NEU_BAND
     return 0.0
@@ -188,6 +221,14 @@ def load_interaction_rows():
         if not item.get("text"):
             continue
         if not item.get("loc_label"):
+            continue
+        # The interaction rows were annotated on whichever axis was active when the
+        # like was recorded. On a different axis none of its labels appear in their
+        # logprobs, and get_class would read the uniform -20.0 fallback as an argmax
+        # win for the first label - injecting them as top-band positives (190 of 322
+        # LoC rows landed at 6.0-9.0 on the assist axis). A row that says nothing
+        # about this axis belongs in no band at all.
+        if POSITIVE_LABEL not in item.get("raw_logprobs", {}):
             continue
         item["is_interaction"] = True
         rows.append(item)
@@ -246,8 +287,11 @@ def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
         m["dev_auc_teacher"] = 0.0
 
     s_val = X_val @ v
-    m["val_auc_internal"] = float(roc_auc_score(val_internal, s_val))
-    m["val_avg_precision"] = float(average_precision_score(val_internal, s_val))
+    # A validation set drawn from the firehose can be single-class on a sparse axis
+    # (e.g. no 'helpful' post at all); the binary metrics are undefined there.
+    if 0 < val_internal.sum() < len(val_internal):
+        m["val_auc_internal"] = float(roc_auc_score(val_internal, s_val))
+        m["val_avg_precision"] = float(average_precision_score(val_internal, s_val))
     for k in (10, 25, 50):
         m[f"val_precision@{k}"] = precision_at_k(s_val, val_internal, k)
     if teacher_mask.sum() > 10:
@@ -336,13 +380,23 @@ def main():
         X = np.vstack([X, X_int])
         print(f"Added {len(X_int)} real interactions to training set.")
 
-    val_data = np.load(CACHE_GEMINI_EMBS, allow_pickle=True)
-    X_val, y_val = val_data["X"], val_data["y"]
+    # Cache is keyed to the *filtered* val rows, so a cache built for another axis
+    # (different VALID_LABELS -> different row count) is recomputed, not asserted on.
+    val_rows = load_val_rows()
+    X_val = y_val = None
+    if os.path.exists(CACHE_GEMINI_EMBS):
+        val_data = np.load(CACHE_GEMINI_EMBS, allow_pickle=True)
+        X_val, y_val = val_data["X"], val_data["y"]
+    if X_val is None or len(X_val) != len(val_rows):
+        print(f"Validation embeddings cache invalid or missing. "
+              f"Computing {len(val_rows)} embeddings...")
+        X_val = compute_embeddings([r["text"] for r in val_rows])
+        y_val = np.array([r["loc_label"] for r in val_rows])
+        np.savez_compressed(CACHE_GEMINI_EMBS, X=X_val, y=y_val)
     X_val = np.nan_to_num(X_val)
     X_val /= np.linalg.norm(X_val, axis=1, keepdims=True)
     if isinstance(y_val[0], str):
         y_val = np.array([LABEL_MAP.get(l, 2) for l in y_val])
-    val_rows = load_val_rows()
     assert len(val_rows) == len(X_val), (
         f"Val row mismatch: {len(val_rows)} jsonl rows vs {len(X_val)} cached embeddings"
     )
@@ -410,7 +464,7 @@ def main():
                              p_val_teacher, teacher_mask, val_rel, val_external)
                 key = f"{name}_T{T}_W{W}"
                 all_results[key] = m
-                print(f"{key:26s} valAUC_int={m['val_auc_internal']:.4f} "
+                print(f"{key:26s} valAUC_int={m.get('val_auc_internal', float('nan')):.4f} "
                       f"extLeak={m.get('val_ext_leak_auc', 0.0):.4f} "
                       f"gnDCG={m.get('val_ndcg_graded', 0.0):.4f} "
                       f"gSpear={m.get('val_spearman_graded', 0.0):.4f} "
