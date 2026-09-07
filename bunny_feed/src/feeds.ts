@@ -35,6 +35,36 @@ export type FeedConfig = {
    * to serve to all readers.
    */
   forcePublic?: boolean;
+  /**
+   * Number of parallel GE candidate calls. GE caps num_candidates at 1000 per
+   * request, and the popularity/network_likes/two_tower mix is effectively
+   * deterministic (repeat calls overlap 99%), so a bigger pool has to come from
+   * `random_posts`, whose calls overlap 0%. Call 1 is the normal mix; the rest
+   * are random_posts. Measured: fan 4 -> ~4000 unique in ~2.2s, fan 8 -> ~8000
+   * but ~13s, which is too slow for a feed request. Default 1 = today's
+   * behavior, one call, no random_posts.
+   */
+  fanout?: number;
+  /**
+   * Candidates requested per GE call. GE's ceiling is 1000; the default stays
+   * at the original 500 so feeds that did not ask for a bigger pool keep their
+   * existing cost and behavior.
+   */
+  numCandidates?: number;
+  /**
+   * Cheap text gate applied to candidates BEFORE embedding. Free (no API call)
+   * and the only thing that makes a large fanned-out pool affordable: it cuts
+   * ~4000 candidates to the few hundred worth paying Jina for.
+   */
+  candidateFilter?: RegExp;
+  /**
+   * What decides the final order. 'ge' hands survivors to GE's reranker (the
+   * original behavior). 'score' orders by this feed's own vector score and
+   * skips the rerank call — correct when the vector *is* the editorial
+   * criterion, since GE's ranker optimizes engagement and reorders almost
+   * independently of it (measured Spearman 0.277 against the assist score).
+   */
+  rankBy?: 'ge' | 'score';
 };
 
 // Locus-of-control axis: posts showing agency over posts showing helplessness.
@@ -71,11 +101,26 @@ export const FEEDS: Record<string, FeedConfig> = {
   // 94.9% of the posts an independent Gemini-labelled set called helpful.
   // 0.92 would keep only ~6% (~31 candidates) and starve the reranker; raise
   // num_candidates first if you want that sharper operating point.
+  //
+  // The candidate pipeline matters as much as the vector here. Served straight
+  // off GE's default pool this feed returned 0 genuine requests in 30 posts:
+  // only 20% of what GE surfaces even contains a question mark, because its
+  // generators optimize for engagement and a real help request usually sits
+  // unanswered. The vector is fine — it scores AUC 0.867 on a question-filtered
+  // pool — it was just being asked to find ~7 needles in 500 general posts.
+  //
+  // So: fan out to ~4000 candidates, keep only the question-bearing ones (~304,
+  // versus 78 from a single call), and order by the assist score rather than by
+  // GE's engagement ranker.
   'helpful-feed': {
     rkey: 'helpful-feed',
     name: 'Helpful Feed',
     scorer: createScorer(helpfulVectorData as VectorData),
     threshold: 0.90,
+    fanout: 4,
+    numCandidates: 1000,
+    candidateFilter: /\?/,
+    rankBy: 'score',
   },
 };
 

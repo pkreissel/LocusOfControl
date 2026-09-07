@@ -523,39 +523,69 @@ async function handleRequest(request: Request): Promise<Response> {
       tPrune = Date.now() - tS_start;
 
       const tC_start = Date.now();
+      let candRaw = 0;
       try {
-        const genBody: any = {
-          generators: [
-            { name: primaryGenerator, weight: 1.0 },
-            { name: 'network_likes', weight: 1.0 },
-            { name: 'two_tower', weight: 1.0 }
-          ],
-          infill: 'popularity',
-          user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
-          num_candidates: 500,
-          // Restrict candidates to the last 3 days. GE's allowed values are
-          // 6/12/24/48/72/168; the infill generator inherits this window too,
-          // so it can't widen eligibility. Smaller pool → may lower yield
-          // past the 0.55 vector filter; raise num_candidates if feed runs short.
-          max_age_hours: 72
+        const buildBody = (gens: { name: string; weight: number }[]) => {
+          const b: any = {
+            generators: gens,
+            infill: 'popularity',
+            user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
+            num_candidates: feedConfig.numCandidates ?? 500,
+            // Restrict candidates to the last 3 days. GE's allowed values are
+            // 6/12/24/48/72/168; the infill generator inherits this window too,
+            // so it can't widen eligibility.
+            max_age_hours: 72
+          };
+          // Only send the key when non-empty so the unauthenticated path stays
+          // byte-identical to before and we never send an empty array.
+          if (excludeUris.length > 0) b.exclude_uris = excludeUris;
+          return b;
         };
-        // Only send the key when non-empty so the unauthenticated path stays
-        // byte-identical to before and we never send an empty array.
-        if (excludeUris.length > 0) genBody.exclude_uris = excludeUris;
-        const candRes = await fetch('https://api.greenearth.social/candidates/generate', {
-          method: 'POST',
-          headers: geHeaders,
-          body: JSON.stringify(genBody)
-        });
-        if (!candRes.ok) {
-          throw new Error(`GE Generate failed: ${candRes.status}`);
+
+        // Call 1 is the normal generator mix. Any further calls are
+        // `random_posts`, which is the only generator that returns a different
+        // sample each time (the mix repeats itself 99%), so it is what actually
+        // grows the pool past GE's 1000-per-request cap.
+        const bodies = [buildBody([
+          { name: primaryGenerator, weight: 1.0 },
+          { name: 'network_likes', weight: 1.0 },
+          { name: 'two_tower', weight: 1.0 },
+        ])];
+        for (let i = 1; i < (feedConfig.fanout ?? 1); i++) {
+          bodies.push(buildBody([{ name: 'random_posts', weight: 1.0 }]));
         }
-        const candData = await candRes.json();
-        candidates = (candData.candidates || []).map((c: any) => ({
-            ...c,
-            uri: c.at_uri,
-            text: c.content || ''
+
+        // One slow or failing call must not lose the others' candidates.
+        const batches = await Promise.all(bodies.map(async (body) => {
+          try {
+            const r = await fetch('https://api.greenearth.social/candidates/generate', {
+              method: 'POST', headers: geHeaders, body: JSON.stringify(body),
+            });
+            if (!r.ok) throw new Error(`GE Generate failed: ${r.status}`);
+            return (await r.json()).candidates || [];
+          } catch (e: any) {
+            console.error("[getFeedSkeleton] GE generate call failed:", e?.message || String(e));
+            return [];
+          }
         }));
+
+        const seenUri = new Set<string>();
+        const merged: Candidate[] = [];
+        for (const batch of batches) {
+          for (const c of batch as any[]) {
+            if (!c?.at_uri || seenUri.has(c.at_uri)) continue;
+            seenUri.add(c.at_uri);
+            merged.push({ ...c, uri: c.at_uri, text: c.content || '' });
+          }
+        }
+        candRaw = merged.length;
+
+        // Cheap text gate before any embedding. This is what makes a fanned-out
+        // pool affordable: the regex is free, Jina is not. Feeds without a
+        // filter keep the whole pool, exactly as before.
+        candidates = feedConfig.candidateFilter
+          ? merged.filter(c => feedConfig.candidateFilter!.test(c.text))
+          : merged;
       } catch (err: any) {
         console.error("[getFeedSkeleton] GE generate fetch failed:", err?.message || String(err));
       }
@@ -599,7 +629,14 @@ async function handleRequest(request: Request): Promise<Response> {
 
         tEmbed = Date.now() - tE_start;
         
-        if (filteredCandidates.length > 0) {
+        if (filteredCandidates.length > 0 && feedConfig.rankBy === 'score') {
+          // The vector IS the editorial criterion for this feed, and
+          // filteredCandidates is already sorted by it. Handing that order to
+          // GE's engagement ranker scrambles it — measured Spearman 0.277
+          // between served rank and assist score — so skip the rerank call
+          // entirely. Also saves a round-trip.
+          tRank = 0;
+        } else if (filteredCandidates.length > 0) {
           const tR_start = Date.now();
           // (4) Rank via Green Earth
           try {
@@ -702,7 +739,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       logFeed({
         feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
-        cand: candidates.length, pass: rankedUris.length,
+        candRaw, cand: candidates.length, pass: rankedUris.length,
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
