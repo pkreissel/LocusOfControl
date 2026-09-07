@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real, index } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, real, index, primaryKey } from 'drizzle-orm/sqlite-core';
 import { sql } from 'drizzle-orm';
 
 export const embeddingUsage = sqliteTable('embedding_usage', {
@@ -40,14 +40,24 @@ export const postEmbeddings = sqliteTable('post_embeddings', {
 // win rather than a cost-only one.
 //
 // `version` scopes entries to BOTH the embedding model and the scoring vector
-// (`${EMBEDDING_MODEL}:${VECTOR_VERSION}`), so changing either one invalidates
+// (`${EMBEDDING_MODEL}:${scorer.version}`), so changing either one invalidates
 // old rows via an ordinary cache miss. Pruned opportunistically by `createdAt`.
+//
+// The primary key is (uri, version), not uri alone. Once one deployment served
+// more than one feed, each with its own vector, a uri-only key meant the two
+// feeds fought over a single row: whichever ran last overwrote the other's
+// score, and the loser then read its own row back as a version mismatch. Both
+// feeds would have missed on essentially every candidate forever, doubling the
+// Jina bill while looking like a working cache. The composite key lets one post
+// hold one score per scoring model, which is what the version column always
+// meant.
 export const postScores = sqliteTable('post_scores', {
-  uri: text('uri').primaryKey(),
-  score: real('score').notNull(),              // sigmoid probability from scoreEmbedding()
+  uri: text('uri').notNull(),
+  score: real('score').notNull(),              // sigmoid probability from the feed's scorer
   version: text('version').notNull(),          // embedding model + scoring-vector fingerprint
   createdAt: integer('created_at').notNull(),  // unix ms, for the prune
 }, (t) => [
+  primaryKey({ columns: [t.uri, t.version] }),
   // Serves the opportunistic prune (WHERE created_at < cutoff), which otherwise
   // full-scans. created_at is monotonic, so inserts append to the index edge.
   index('post_scores_created_at_idx').on(t.createdAt),

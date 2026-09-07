@@ -241,17 +241,23 @@ export async function getCachedScores(uris: string[], version: string): Promise<
 
 // Upsert freshly-computed scores. `entries` must be de-duplicated by uri (SQLite
 // rejects updating the same row twice in one statement).
-export async function putScores(entries: { uri: string; score: number }[], version: string): Promise<void> {
+// Each entry carries its own `version`: one embedding is scored against every
+// registered feed's vector in a single pass (see scoreCandidates), so one call
+// writes several versions' rows at once.
+export async function putScores(entries: { uri: string; score: number; version: string }[]): Promise<void> {
   if (entries.length === 0) return;
   const db = getDbClient();
   const now = Date.now();
   for (let i = 0; i < entries.length; i += SCORE_WRITE_CHUNK) {
     const chunk = entries.slice(i, i + SCORE_WRITE_CHUNK);
     await db.insert(postScores)
-      .values(chunk.map(e => ({ uri: e.uri, score: e.score, version, createdAt: now })))
+      .values(chunk.map(e => ({ uri: e.uri, score: e.score, version: e.version, createdAt: now })))
+      // Conflict target must match the (uri, version) primary key: keyed on uri
+      // alone, a second feed's vector would overwrite the first's score for the
+      // same post instead of sitting alongside it.
       .onConflictDoUpdate({
-        target: postScores.uri,
-        set: { score: sql`excluded.score`, version: sql`excluded.version`, createdAt: sql`excluded.created_at` },
+        target: [postScores.uri, postScores.version],
+        set: { score: sql`excluded.score`, createdAt: sql`excluded.created_at` },
       });
   }
 }

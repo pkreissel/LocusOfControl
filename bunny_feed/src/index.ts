@@ -1,6 +1,6 @@
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
-import { scoreEmbedding, VECTOR_VERSION } from './vector';
+import { resolveFeed, ALL_SCORERS, type FeedConfig } from './feeds';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 
@@ -18,22 +18,11 @@ function errChain(e: any): string {
   return parts.join(' <- ');
 }
 
-// Recalibrated for the vector retrained in 4a9286e, which shifted the score
-// distribution up: its cosines span roughly -0.22..+0.25, so with scale 6.542 /
-// bias 1.807 nothing scores below ~0.59 and the old 0.55 rejected *nothing* —
-// measured over 17.5k dataset texts and 993 live two-tower candidates alike.
-//
-// 0.88 restores the "passes ~50%" intent the old constant was tuned for: it
-// keeps 47% of corpus texts and 34% of live candidates (~172 of 500, still
-// clear of MAX_RERANK_CANDIDATES). On the held-out validation set it keeps 76%
-// of internal posts against 26% of external ones. Going to 0.90 sharpens that
-// to 54%/12% but leaves only ~104 live candidates, which would starve the
-// reranker — raise num_candidates first if you want that operating point.
-//
-// NB this constant tracks the vector: any retrain moves the distribution and
-// must move this number with it (a percentile calibrated at export time would
-// be sturdier than a hard-coded probability).
-const VECTOR_PROB_THRESHOLD = 0.88;
+// Each feed's vector-probability gate now lives with its vector in feeds.ts,
+// because the number is only meaningful relative to one vector's score
+// distribution: the LoC gate sat at 0.55 for a while and rejected literally
+// nothing after a retrain moved the distribution out from under it. See the
+// calibration notes on each FeedConfig.
 
 // Maximum number of candidates to send to the final GE reranker (rank/predict)
 const MAX_RERANK_CANDIDATES = 100;
@@ -209,7 +198,11 @@ async function safeCachePut(cache: Cache, key: string, res: Response): Promise<v
 //
 // SCORE_CACHE_VERSION scopes entries to the embedding model AND the scoring
 // vector, so retraining either invalidates old rows by simple cache miss.
-const SCORE_CACHE_VERSION = `${EMBEDDING_MODEL}:${VECTOR_VERSION}`;
+// Also what keeps two feeds' scores for the same post apart: each vector has its
+// own fingerprint, and (uri, version) is the score cache's key.
+function scoreCacheVersion(scorer: { version: string }): string {
+  return `${EMBEDDING_MODEL}:${scorer.version}`;
+}
 
 type ScoreResult = {
   scores: (number | null)[];
@@ -220,11 +213,11 @@ type ScoreResult = {
   failedChunks: number;
 };
 
-async function scoreCandidates(cands: Candidate[], apiKey: string): Promise<ScoreResult> {
+async function scoreCandidates(cands: Candidate[], apiKey: string, feed: FeedConfig): Promise<ScoreResult> {
   const scores: (number | null)[] = new Array(cands.length).fill(null);
 
   // Batch-load cached scores. Best-effort: a DB error just means "all miss".
-  const cached = await getCachedScores(cands.map(c => c.uri), SCORE_CACHE_VERSION)
+  const cached = await getCachedScores(cands.map(c => c.uri), scoreCacheVersion(feed.scorer))
     .catch((e: any) => { console.error("[score cache] read failed:", errChain(e)); return new Map<string, number>(); });
 
   // De-duplicate misses by uri: Jina is billed per unique text, and SQLite
@@ -266,7 +259,7 @@ async function scoreCandidates(cands: Candidate[], apiKey: string): Promise<Scor
 
     // Fold each fresh embedding down to its score. A null embedding means that
     // Jina chunk failed; the candidate stays unscored and drops out of the feed.
-    const missScores: (number | null)[] = res.embeddings.map(e => (e ? scoreEmbedding(e).probability : null));
+    const missScores: (number | null)[] = res.embeddings.map(e => (e ? feed.scorer.score(e).probability : null));
 
     // Fill every still-empty slot (including duplicate uris) from the results.
     for (let i = 0; i < cands.length; i++) {
@@ -284,10 +277,23 @@ async function scoreCandidates(cands: Candidate[], apiKey: string): Promise<Scor
     // point of this path, and a deferred write that silently fails would leave the
     // cache permanently cold with no signal. Prunes and telemetry, which nothing
     // depends on, still go through runAfterResponse.
-    const toStore = missUris
-      .map((uri, k) => ({ uri, score: missScores[k] }))
-      .filter((e): e is { uri: string; score: number } => e.score !== null);
-    await putScores(toStore, SCORE_CACHE_VERSION)
+    //
+    // Scored against EVERY registered vector, not just the one this request
+    // needs, and stored as a row per version. The Jina call is what costs money;
+    // each extra scorer is a dot product over an embedding we already hold in
+    // memory. Without this, a post embedded for one feed is a version miss for
+    // the next and would be embedded — and billed — a second time for the very
+    // same text.
+    const toStore: { uri: string; score: number; version: string }[] = [];
+    for (const scorer of ALL_SCORERS) {
+      const version = scoreCacheVersion(scorer);
+      for (let k = 0; k < missUris.length; k++) {
+        const emb = res.embeddings[k];
+        if (!emb) continue;   // failed Jina chunk: nothing to score, for any feed
+        toStore.push({ uri: missUris[k], score: scorer.score(emb).probability, version });
+      }
+    }
+    await putScores(toStore)
       .catch((e: any) => console.error("[score cache] write failed:", errChain(e)));
   }
 
@@ -342,9 +348,11 @@ async function handleRequest(request: Request): Promise<Response> {
       }
       const feedUriParam = url.searchParams.get('feed') || '';
       const rkey = feedUriParam.split('/').pop() || 'unknown';
-      const isSelbstwirksamkeit = rkey === 'selbstwirksamkeit';
+      // Which vector ranks this request, and at what gate. An unknown rkey falls
+      // back to the locus-of-control feed rather than erroring.
+      const feedConfig = resolveFeed(rkey);
 
-      if (isSelbstwirksamkeit) {
+      if (feedConfig.forcePublic) {
         userDid = null; // force unauthenticated path
       }
 
@@ -379,7 +387,7 @@ async function handleRequest(request: Request): Promise<Response> {
         // under a personalized key would be re-served as "English" with no
         // trace — surface the markers we stored on write so it shows in logs.
         logFeed({
-          did: didTag, cursor: cursorTag(startCursor), cache: 'hit',
+          feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'hit',
           personalized: cachedSkeleton.headers.get('X-Personalized'),
           path: cachedSkeleton.headers.get('X-Feed-Path'),
           cand: cachedSkeleton.headers.get('X-Cand-Count'),
@@ -421,7 +429,7 @@ async function handleRequest(request: Request): Promise<Response> {
           const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
           if (nextOffset < session.uris.length) body.cursor = encodeCursor(decoded.sessionId, nextOffset);
           logFeed({
-            did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'cont',
+            feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'cont',
             off: decoded.offset, limit, feedLen: page.length,
             nextCursor: body.cursor ? 'y' : 'n', ms: Date.now() - t0,
           });
@@ -457,7 +465,7 @@ async function handleRequest(request: Request): Promise<Response> {
           const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
           if (limit < latest.uris.length) body.cursor = encodeCursor(latest.sessionId, limit);
           logFeed({
-            did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'reuse',
+            feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'reuse',
             off: 0, limit, feedLen: page.length,
             nextCursor: body.cursor ? 'y' : 'n', ms: Date.now() - t0,
           });
@@ -559,7 +567,7 @@ async function handleRequest(request: Request): Promise<Response> {
       if (candidates.length > 0) {
         const tE_start = Date.now();
         // (3) Reuse cached scores; only cache-missed posts are sent to Jina.
-        const scored = await scoreCandidates(candidates, apiKey);
+        const scored = await scoreCandidates(candidates, apiKey, feedConfig);
         embedHits = scored.hits;
         embedMisses = scored.misses;
         embedChunks = scored.chunks;
@@ -574,7 +582,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
         for (let i = 0; i < candidates.length; i++) {
           const p = scored.scores[i];
-          if (p !== null && p >= VECTOR_PROB_THRESHOLD) {
+          if (p !== null && p >= feedConfig.threshold) {
             // Overwrite the generator's popularity `score` (unused after ranking)
             // with the vector-similarity probability so GE's `candidate_score`
             // model can blend it into the final rank order (see RANK_SIM_WEIGHT).
@@ -693,7 +701,7 @@ async function handleRequest(request: Request): Promise<Response> {
       }
 
       logFeed({
-        did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
+        feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
         cand: candidates.length, pass: rankedUris.length,
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
