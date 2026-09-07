@@ -31,8 +31,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rkey", required=True,
                     help="record key; must match a key in bunny_feed/src/feeds.ts")
-    ap.add_argument("--name", required=True, help="displayName shown in the app")
-    ap.add_argument("--description", required=True)
+    ap.add_argument("--name", help="displayName shown in the app (required unless --delete)")
+    ap.add_argument("--description", help="required unless --delete")
+    ap.add_argument("--delete", action="store_true",
+                    help="unpublish: remove the feed generator record entirely")
     ap.add_argument("--hostname", default=DEFAULT_HOSTNAME)
     ap.add_argument("--dry-run", action="store_true",
                     help="print the record that would be written and exit")
@@ -44,11 +46,17 @@ def main():
     if not handle or not app_password:
         sys.exit("Set BLUESKY_HANDLE and BLUESKY_APP_PASSWORD in your .env file")
 
+    if not args.delete and not (args.name and args.description):
+        sys.exit("--name and --description are required unless --delete is given")
+
     did_web = f"did:web:{args.hostname}"
     print(f"rkey:        {args.rkey}")
-    print(f"displayName: {args.name}")
-    print(f"description: {args.description}")
-    print(f"service:     {did_web}")
+    if args.delete:
+        print("action:      DELETE (unpublish)")
+    else:
+        print(f"displayName: {args.name}")
+        print(f"description: {args.description}")
+        print(f"service:     {did_web}")
     if args.dry_run:
         print("\n(dry run — nothing published)")
         return
@@ -59,6 +67,17 @@ def main():
     print(f"\nLogging in as {handle} on {pds_url}...")
     client = Client(base_url=pds_url)
     client.login(handle, app_password)
+
+    if args.delete:
+        client.com.atproto.repo.delete_record(
+            models.ComAtprotoRepoDeleteRecord.Data(
+                repo=client.me.did,
+                collection="app.bsky.feed.generator",
+                rkey=args.rkey,
+            )
+        )
+        print(f"\n\u2705 Feed unpublished: {args.rkey}")
+        return
 
     response = client.com.atproto.repo.put_record(
         models.ComAtprotoRepoPutRecord.Data(

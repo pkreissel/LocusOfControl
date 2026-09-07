@@ -1,6 +1,5 @@
 import { createScorer, type Scorer, type VectorData } from './vector';
 import locVectorData from './vector.json';
-import helpfulVectorData from './vector_helpful.json';
 
 // --- Feed registry ---------------------------------------------------------
 //
@@ -84,6 +83,17 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   threshold: 0.88,
 };
 
+// Note: feeds published under this did:web but absent here (fem-feed,
+// climate-optim) resolve to DEFAULT_FEED, which is the behavior they had before
+// this registry existed.
+//
+// The assist axis ('helpful-feed') was tried and scrapped: GE's candidate pool
+// cannot supply enough genuine help requests to build on. It caps at 1000
+// candidates per request, only ~7 per 1000 match a help cue, the
+// popularity/network_likes/two_tower mix repeats itself 99% across calls, and
+// fanning out random_posts to ~8000 takes ~13s. src/vector_helpful.json is kept
+// (unreferenced) because *.npy is gitignored, so it is the only committed copy
+// of that trained vector.
 export const FEEDS: Record<string, FeedConfig> = {
   'feed-forward': { rkey: 'feed-forward', name: 'Feed Forward', ...LOC },
   // Same vector, but served identically to everyone (no personalization).
@@ -92,35 +102,6 @@ export const FEEDS: Record<string, FeedConfig> = {
     name: 'Selbstwirksamkeit',
     ...LOC,
     forcePublic: true,
-  },
-  // Assist axis: genuine, situated requests for help or advice that a reader
-  // could actually answer, over questions that lead nowhere.
-  //
-  // 0.90 keeps ~24% of a firehose-random sample — about 120 of 500 GE
-  // candidates, which is where MAX_RERANK_CANDIDATES sits — while retaining
-  // 94.9% of the posts an independent Gemini-labelled set called helpful.
-  // 0.92 would keep only ~6% (~31 candidates) and starve the reranker; raise
-  // num_candidates first if you want that sharper operating point.
-  //
-  // The candidate pipeline matters as much as the vector here. Served straight
-  // off GE's default pool this feed returned 0 genuine requests in 30 posts:
-  // only 20% of what GE surfaces even contains a question mark, because its
-  // generators optimize for engagement and a real help request usually sits
-  // unanswered. The vector is fine — it scores AUC 0.867 on a question-filtered
-  // pool — it was just being asked to find ~7 needles in 500 general posts.
-  //
-  // So: fan out to ~4000 candidates, keep only the question-bearing ones (~304,
-  // versus 78 from a single call), and order by the assist score rather than by
-  // GE's engagement ranker.
-  'helpful-feed': {
-    rkey: 'helpful-feed',
-    name: 'Helpful Feed',
-    scorer: createScorer(helpfulVectorData as VectorData),
-    threshold: 0.90,
-    fanout: 4,
-    numCandidates: 1000,
-    candidateFilter: /\?/,
-    rankBy: 'score',
   },
 };
 
