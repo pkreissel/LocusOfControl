@@ -6,7 +6,8 @@ import numpy as np
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
 
-from label_prompts import LETTER_TO_LABEL, LETTER_TO_LABEL_ASSIST, get_teacher_prompt, prompt_version
+from label_prompts import (LETTER_TO_LABEL, LETTER_TO_LABEL_ASSIST, LETTER_TO_LABEL_VIRTUE,
+                           axis_labels, get_teacher_prompt, prompt_version)
 
 INPUT_FILE = os.environ.get("LOC_INPUT_FILE", "dataset_raw.jsonl")
 OUTPUT_FILE = os.environ.get("LOC_OUTPUT_FILE", "dataset_annotated_lmstudio_soft.jsonl")
@@ -16,8 +17,30 @@ MODEL_NAME = os.environ.get("LOC_TEACHER_MODEL", "meta/muse-glimmer")
 TOP_LOGPROBS = int(os.environ.get("LOC_TOP_LOGPROBS", "10"))
 TEMPERATURE = float(os.environ.get("LOC_TEMPERATURE", "1.0"))
 TOP_P = float(os.environ.get("LOC_TOP_P", "0.95"))
+# Cap generation. Without this a post that sends the teacher into a long <think>
+# block runs to the context limit and stalls its worker; run_all*.sh already
+# exported LOC_MAX_TOKENS, it was just never read here.
+MAX_TOKENS = int(os.environ.get("LOC_MAX_TOKENS", "1500"))
+REQUEST_TIMEOUT = float(os.environ.get("LOC_REQUEST_TIMEOUT", "180"))
+# A failed post used to be dropped silently, which quietly shrinks a long run.
+# llama.cpp splits its context across parallel slots, so under contention a
+# request can come back "Context size has been exceeded" purely transiently.
+MAX_RETRIES = int(os.environ.get("LOC_MAX_RETRIES", "3"))
+RETRY_BACKOFF = float(os.environ.get("LOC_RETRY_BACKOFF", "5"))
+
 
 async def annotate_post(client, post, sem, system_prompt):
+    for attempt in range(MAX_RETRIES):
+        result = await _annotate_once(client, post, sem, system_prompt, attempt)
+        if result is not None:
+            return result
+        if attempt + 1 < MAX_RETRIES:
+            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+    tqdm.write(f"Giving up on {post.get('uri')} after {MAX_RETRIES} attempts.")
+    return None
+
+
+async def _annotate_once(client, post, sem, system_prompt, attempt):
     async with sem:
         try:
             # We add a hint for controllable reasoning strength if supported by glimmer
@@ -31,6 +54,8 @@ async def annotate_post(client, post, sem, system_prompt):
                 messages=messages,
                 temperature=TEMPERATURE,
                 top_p=TOP_P,
+                max_tokens=MAX_TOKENS,
+                timeout=REQUEST_TIMEOUT,
                 logprobs=True,
                 top_logprobs=TOP_LOGPROBS,
             )
@@ -43,11 +68,16 @@ async def annotate_post(client, post, sem, system_prompt):
             
             is_v4 = prompt_version() == "v4"
             is_assist = prompt_version() == "assist"
+            is_virtue = prompt_version() == "virtue"
+            # Axes that emit the Label/Level/Score triple (v4 included).
+            is_graded = is_v4 or is_assist or is_virtue
 
             def token_to_label(token):
                 t = token.strip().lower().replace(".", "").replace("\n", "")
                 if is_assist:
                     return LETTER_TO_LABEL_ASSIST.get(t)
+                if is_virtue:
+                    return LETTER_TO_LABEL_VIRTUE.get(t)
                 if is_v4 or prompt_version() in ["v2", "v3"]:
                     return LETTER_TO_LABEL.get(t)
                 return t if t in ["internal", "external", "neutral"] else None
@@ -73,18 +103,18 @@ async def annotate_post(client, post, sem, system_prompt):
             # only the Level digit.
             for idx in range(len(logprobs_content) - 1, -1, -1):
                 tok = logprobs_content[idx].token
-                if (is_v4 or is_assist) and score_idx is None and token_to_score(tok) is not None:
+                if is_graded and score_idx is None and token_to_score(tok) is not None:
                     score_idx = idx
                 elif level_idx is None and token_to_level(tok) is not None:
                     level_idx = idx
                 elif label_idx is None and token_to_label(tok) is not None:
                     label_idx = idx
                 if label_idx is not None and level_idx is not None and (
-                    not (is_v4 or is_assist) or score_idx is not None
+                    not is_graded or score_idx is not None
                 ):
                     break
 
-            labels = ["helpful", "inert", "neutral"] if is_assist else ["internal", "external", "neutral"]
+            labels = axis_labels()
             class_logprobs = {lbl: -20.0 for lbl in labels}
             level_logprobs = {"1": -20.0, "2": -20.0, "3": -20.0}
             score_logprobs = {str(d): -20.0 for d in range(10)}
@@ -115,10 +145,8 @@ async def annotate_post(client, post, sem, system_prompt):
             if total_prob > 0:
                 normalized_probs = {k: (v / total_prob) for k, v in probs.items()}
             else:
-                if is_assist:
-                    normalized_probs = {"helpful": 0.33, "inert": 0.33, "neutral": 0.34}
-                else:
-                    normalized_probs = {"internal": 0.33, "external": 0.33, "neutral": 0.34}
+                pos, neg, neu = axis_labels()
+                normalized_probs = {pos: 0.33, neg: 0.33, neu: 0.34}
                 
             level_probs = {k: np.exp(v) for k, v in level_logprobs.items()}
             total_level_prob = sum(level_probs.values())
@@ -153,6 +181,7 @@ async def annotate_post(client, post, sem, system_prompt):
             
             return post
         except Exception as e:
+            tqdm.write(f"  attempt {attempt + 1}/{MAX_RETRIES} failed: {type(e).__name__}")
             tqdm.write(f"Error on post {post.get('uri')}: {e}")
             return None
 

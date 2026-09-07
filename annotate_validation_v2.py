@@ -1,8 +1,10 @@
-"""Re-annotate the 500 validation posts with the current Gemini v2 prompt.
+"""Re-annotate the 500 validation posts with the current Gemini validation prompt.
 
-Reads dataset_validation_gemini.jsonl (posts + v1 labels), writes
-dataset_validation_gemini_v2.jsonl with loc_label (v2) and loc_label_v1.
-Resumable; run again to fill any failures.
+Reads the post source (LOC_VAL_INPUT, default dataset_validation_gemini.jsonl),
+writes LOC_VAL_OUTPUT with loc_label from the prompt version's axis and the
+source label kept as loc_label_v1. The axis follows LOC_PROMPT_VERSION, so this
+also produces the assist validation set (helpful/inert/neutral) over the same
+posts. Resumable; run again to fill any failures.
 
 Run: uv run --with google-genai --with python-dotenv --with tqdm python annotate_validation_v2.py
 """
@@ -16,8 +18,9 @@ from google import genai
 from google.genai import types
 from tqdm import tqdm
 
-from label_prompts import get_validation_prompt, prompt_version
+from label_prompts import axis_labels, get_validation_prompt, prompt_version
 
+INPUT_FILE = os.environ.get("LOC_VAL_INPUT", "dataset_validation_gemini.jsonl")
 OUTPUT_FILE = os.environ.get("LOC_VAL_OUTPUT", "dataset_validation_gemini_v2.jsonl")
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
@@ -25,9 +28,12 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"
 def main():
     load_dotenv()
     client = genai.Client(api_key=os.environ["GAI_API"])
-    print(f"Using validation prompt version: {prompt_version()}")
+    # [positive, negative, neutral] for the active axis; neutral is the fallback.
+    positive, negative, neutral = axis_labels()
+    print(f"Using validation prompt version: {prompt_version()} "
+          f"({positive}/{negative}/{neutral}) on {INPUT_FILE} -> {OUTPUT_FILE}")
 
-    with open("dataset_validation_gemini.jsonl", encoding="utf-8") as f:
+    with open(INPUT_FILE, encoding="utf-8") as f:
         posts = [json.loads(l) for l in f if l.strip()]
 
     done = set()
@@ -49,7 +55,7 @@ def main():
                             system_instruction=get_validation_prompt(), temperature=0.0),
                     )
                     raw = response.text.strip().lower()
-                    label = next((l for l in ["internal", "external"] if l in raw), "neutral")
+                    label = next((l for l in (positive, negative) if l in raw), neutral)
                     record = {"uri": post["uri"], "text": post["text"],
                               "loc_label": label, "loc_label_v1": post.get("loc_label")}
                     f.write(json.dumps(record) + "\n")
