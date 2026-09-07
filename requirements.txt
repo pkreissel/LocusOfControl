@@ -10,3 +10,4 @@ tqdm
 python-dotenv
 accelerate
 cryptography==48.0.1
+peft>=0.10.0

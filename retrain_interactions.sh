@@ -14,7 +14,7 @@ VAL_FILE=dataset_validation_gemini_${LOC_PROMPT_VERSION}.jsonl
 EMB_CACHE=embeddings_${TAG}_jina.npz
 VECTOR=internal_vector_${TAG}.npy
 
-PY="uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers --with einops --with datasets --with accelerate --with openai --with google-genai --with python-dotenv --with tqdm python"
+PY="uv run --with atproto --with numpy --with scipy --with scikit-learn --with torch --with transformers --with einops --with peft --with datasets --with accelerate --with openai --with google-genai --with python-dotenv --with tqdm python"
 
 echo "=== [1/4] Fetching latest interactions from edge DB ==="
 (cd bunny_feed && npx tsx dump_interactions.ts)

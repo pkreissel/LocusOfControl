@@ -25,7 +25,7 @@ VECTOR=internal_vector_${TAG}.npy
 SYNTH_FILE=dataset_synthetic_${TAG}.jsonl
 AUG_FILE=dataset_annotated_${TAG}_aug.jsonl
 
-PY="uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers --with einops --with datasets --with accelerate --with openai --with google-genai --with python-dotenv --with tqdm python"
+PY="uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers --with einops --with peft --with datasets --with accelerate --with openai --with google-genai --with python-dotenv --with tqdm python"
 
 echo "=== [1/8] Fetch follow network (Bluesky creds in .env) ==="
 [ -f network_dids.json ] || $PY 1_fetch_network.py

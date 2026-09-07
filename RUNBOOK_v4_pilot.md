@@ -127,7 +127,7 @@ LOC_EMB_CACHE=embeddings_pilot_v4_jina.npz \
 LOC_VECTOR_OUT=internal_vector_v4.npy \
 LOC_USE_LOC_SCORE=1 \
 uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers \
-   --with tqdm --with einops python train_internal_vector.py 2>&1 | tee train_v4_A.log
+   --with tqdm --with einops --with peft python train_internal_vector.py 2>&1 | tee train_v4_A.log
 ```
 B — legacy target on the same 1500 posts (control):
 ```
@@ -136,7 +136,7 @@ LOC_EMB_CACHE=embeddings_pilot_v4_jina.npz \
 LOC_VECTOR_OUT=internal_vector_ctrl.npy \
 LOC_USE_LOC_SCORE=0 \
 uv run --with numpy --with scipy --with scikit-learn --with torch --with transformers \
-   --with tqdm --with einops python train_internal_vector.py 2>&1 | tee train_v4_B.log
+   --with tqdm --with einops --with peft python train_internal_vector.py 2>&1 | tee train_v4_B.log
 ```
 Each prints a "Final model" block and writes `results_internal_vector_v4.json` /
 `results_internal_vector_ctrl.json`. If embedding compute fails on GPU, it falls back to CPU;
@@ -157,7 +157,7 @@ Ignore P@10/P@25 swings for the decision (noisy small val set); mention them onl
 LOC_TEACHER_FILE=dataset_annotated_pilot_v4.jsonl \
 LOC_OUTPUT_DIR=./loc-reranker-pilot-v4 \
 uv run --with torch --with transformers --with datasets --with scikit-learn \
-   --with accelerate --with einops python train_jina_reranker.py 2>&1 | tee train_reranker_v4.log
+   --with accelerate --with einops --with peft python train_jina_reranker.py 2>&1 | tee train_reranker_v4.log
 ```
 Note: the script header lists `--with flash_attn`; on this Mac flash-attn usually won't build —
 omit it (done above). If the model hard-requires it and errors, skip the reranker and note it;
