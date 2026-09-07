@@ -25,7 +25,10 @@ from google.genai import types
 from openai import OpenAI
 from tqdm import tqdm
 
-from label_prompts import (DEFINITIONS_V3, DEFINITIONS_ASSIST, LABELS, LETTER_TO_LABEL, LETTER_TO_LABEL_ASSIST, TEACHER_PROMPT_V3, TEACHER_PROMPT_ASSIST, prompt_version)
+from label_prompts import (DEFINITIONS_V3, DEFINITIONS_ASSIST, DEFINITIONS_VIRTUE, LABELS,
+                           LETTER_TO_LABEL, LETTER_TO_LABEL_ASSIST, LETTER_TO_LABEL_VIRTUE,
+                           TEACHER_PROMPT_V3, TEACHER_PROMPT_ASSIST, TEACHER_PROMPT_VIRTUE,
+                           prompt_version)
 
 TEACHER_FILE = os.environ.get("LOC_TEACHER_FILE", "dataset_annotated_lmstudio_soft.jsonl")
 EMB_CACHE = os.environ.get("LOC_EMB_CACHE", "embeddings_lmstudio_soft_v3_jina.npz")
@@ -45,6 +48,14 @@ if prompt_version() == "assist":
     _DEFS = DEFINITIONS_ASSIST
     _T_PROMPT = TEACHER_PROMPT_ASSIST
     _L2L = LETTER_TO_LABEL_ASSIST
+elif prompt_version() == "virtue":
+    USE_ASSIST = True
+    _LABELS = ["virtuous", "dogmatic", "neutral"]
+    _POSITIVE = "virtuous"
+    _NEGATIVE = "dogmatic"
+    _DEFS = DEFINITIONS_VIRTUE
+    _T_PROMPT = TEACHER_PROMPT_VIRTUE
+    _L2L = LETTER_TO_LABEL_VIRTUE
 else:
     USE_ASSIST = False
     _LABELS = LABELS
@@ -57,7 +68,8 @@ else:
 
 REWRITE_PROMPT = (
     "You are an expert psycholinguist and writer. Rewrite the given social media post so "
-    "that its Locus-of-Control framing becomes '{target}' under these definitions:\n\n"
+    "that its framing on the labelling axis below becomes '{target}' under these definitions:"
+    "\n\n"
     + _DEFS +
     "\nHard constraints:\n"
     "- Same core topic and same language (German stays German, English stays English).\n"
@@ -65,7 +77,9 @@ REWRITE_PROMPT = (
     "- Preserve the author's casual social-media voice exactly: keep hashtags, emoji, "
     "slang, lowercase quirks, imperfect punctuation. The rewrite must read like a real "
     "post by the same person, NOT like polished prose.\n"
-    "- Change as little as possible - flip only the framing of control and agency. "
+    "- Change as little as possible - flip only the framing the axis measures (for the "
+    "virtue axis: how the claim is held - scope, hedging, weighing - NOT the position taken, "
+    "the topic, or the vocabulary level). "
     "Avoid therapy-speak and stock phrases like 'conscious choice', 'deliberate', "
     "'I chose to', 'embraced'. Subtle wording shifts beat added sentences.\n"
     "Reply with ONLY the rewritten post text - no explanations, no quotation marks."
@@ -134,8 +148,7 @@ def teacher_annotate(client, text):
         if label_idx is None:
             continue
             
-        labels = ["helpful", "inert", "neutral"] if USE_ASSIST else ["internal", "external", "neutral"]
-        class_logprobs = {lbl: -20.0 for lbl in labels}
+        class_logprobs = {lbl: -20.0 for lbl in _LABELS}
         level_logprobs = {"1": -20.0, "2": -20.0, "3": -20.0}
 
         decision_token_obj = content[label_idx]
@@ -156,10 +169,7 @@ def teacher_annotate(client, text):
         if total_prob > 0:
             normalized_probs = {k: (v / total_prob) for k, v in probs.items()}
         else:
-            if USE_ASSIST:
-                normalized_probs = {"helpful": 0.33, "inert": 0.33, "neutral": 0.34}
-            else:
-                normalized_probs = {"internal": 0.33, "external": 0.33, "neutral": 0.34}
+            normalized_probs = {_POSITIVE: 0.33, _NEGATIVE: 0.33, "neutral": 0.34}
             
         level_probs = {k: np.exp(v) for k, v in level_logprobs.items()}
         total_level_prob = sum(level_probs.values())
@@ -168,10 +178,8 @@ def teacher_annotate(client, text):
         else:
             normalized_level_probs = {"1": 1.0, "2": 0.0, "3": 0.0}
             
-        if USE_ASSIST:
-            soft_labels = [normalized_probs.get("helpful",0), normalized_probs.get("inert",0), normalized_probs.get("neutral",0)]
-        else:
-            soft_labels = [normalized_probs.get("internal",0), normalized_probs.get("external",0), normalized_probs.get("neutral",0)]
+        soft_labels = [normalized_probs.get(_POSITIVE, 0), normalized_probs.get(_NEGATIVE, 0),
+                       normalized_probs.get("neutral", 0)]
         loc_label = max(normalized_probs, key=normalized_probs.get)
         soft_levels = [normalized_level_probs["1"], normalized_level_probs["2"], normalized_level_probs["3"]]
         loc_level = int(max(normalized_level_probs, key=normalized_level_probs.get))
