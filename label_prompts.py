@@ -17,7 +17,12 @@ Versions:
        logprobs) for learning-to-rank. Keeps the v3 Label/Level lines so all
        existing consumers are unaffected; adds loc_score / loc_score_logprobs.
 
-Select at runtime with LOC_PROMPT_VERSION=v1|v2|v3|v4 (default v1).
+Separate ranking axes (not LoC versions), selected the same way:
+  assist - actionability of a request for help (helpful/inert/neutral).
+  virtue - intellectual virtue vs dogmatism in how a contestable claim is
+           held (virtuous/dogmatic/neutral).
+
+Select at runtime with LOC_PROMPT_VERSION=v1|v2|v3|v4|assist|virtue (default v1).
 """
 
 import os
@@ -293,10 +298,18 @@ DEFINITIONS_ASSIST = (
     "9. Help-Seeking vs Promotional Asks: A request for the reader to buy, subscribe, donate, "
     "vote, or sign up is a promotional ask, not a request for help or advice - it is 'neutral' "
     "(or 'inert' if phrased as engagement-bait). Only requests where the author seeks help, "
-    "advice, or knowledge for themselves are in scope.\n\n"
-    "- 'helpful': The post is a genuine, situated REQUEST for help or advice: a concrete question "
-    "about a real problem with enough context that a respondent could act on it. The request "
-    "leads somewhere. (Actionable, situated, specific).\n"
+    "advice, or knowledge for themselves are in scope.\n"
+    "10. Reading Audience vs Specific Third Party: a request is only 'helpful' if a READER of the "
+    "post could plausibly answer it. A request aimed at one named operator, service desk, "
+    "company, or individual who is not the audience - a support ticket, a booking or account "
+    "query, an @-mention asking one specific person to do something - is 'neutral', however "
+    "concrete and urgent it is. The same holds for posts from automated relay or log accounts "
+    "that reproduce somebody else's operational exchange (radio traffic, dispatch messages, "
+    "ticket feeds): the request was never addressed to the reader, so it is 'neutral'.\n\n"
+    "- 'helpful': The post is a genuine, situated REQUEST for help or advice, addressed to whoever "
+    "reads it: a concrete question about a real problem with enough context that a reader could "
+    "act on it and give the author a useful answer. The request leads somewhere. (Actionable, "
+    "situated, specific, answerable by the audience).\n"
     "- 'inert': The post is a question that leads nowhere: rhetorical or engagement-bait "
     "questions, circular debate prompts, abstract philosophical questions with no practical "
     "resolution, generic advice-solicitation with no situation, or opinion-solicitation that "
@@ -319,22 +332,33 @@ TEACHER_PROMPT_ASSIST = (
     "pytest async with pytest-asyncio 0.23 on Python 3.12, tried @pytest.fixture already, didn't "
     "work - what am I missing?').\n"
     "If the label is 'inert' or 'neutral', always output 'Level: 1'.\n\n"
-    "Additionally, you must rate the post's Actionability on a single 0-9 scale, where higher "
-    "means the request is more concrete and actionable and lower means the question is more "
-    "rhetorical and leading-nowhere. Use the full range:\n"
+    "Additionally, you must rate the post's Answerability on a single 0-9 scale: how well could a "
+    "reader who happens to know the subject actually help this author? Higher means a reader "
+    "could give a genuinely useful answer; lower means no answer would change anything. Use the "
+    "full range:\n"
     "- 0-1 (Strong inert): blatant engagement-bait, clickbait questions, circular debate with no "
     "possible resolution, abstract philosophy, trivia-as-performance.\n"
     "- 2-3 (Mild inert): leans unactionable - somewhat broad advice-solicitation, opinion polls, "
     "questions that won't produce action.\n"
     "- 4-5 (Neutral): no request present, or perfectly balanced between rhetorical and "
     "actionable.\n"
-    "- 6-7 (Helpful, general): a genuine request but somewhat general - real problem without full "
-    "specifics.\n"
-    "- 8-9 (Helpful, concrete): a genuine request AND highly specific - error messages, part "
-    "numbers, code, version info, what was tried (9 for the most concrete and actionable "
-    "request).\n\n"
-    "The Score must be consistent with the Label (inert/neutral score <=5, helpful score >=6) "
-    "and with the Level for helpful posts (Level 1 -> 6, Level 2 -> 7, Level 3 -> 8-9).\n\n"
+    "- 6 (Helpful, but a reader would have to ask a clarifying question before being able to "
+    "answer at all).\n"
+    "- 7 (Helpful and answerable, but broad - many equally valid answers, little to narrow them "
+    "down).\n"
+    "- 8 (Helpful and well-specified - a knowledgeable reader could give a directly useful "
+    "answer straight away).\n"
+    "- 9 (Helpful and fully specified - error text, model or part number, version, what was "
+    "already tried; one reply could resolve it).\n\n"
+    "The Score band is a HARD constraint, checked before you answer: if the Label is H the Score "
+    "MUST be 6, 7, 8 or 9 - never lower, however unanswerable you judge the request to be. If a "
+    "request feels too unanswerable to deserve a 6, that is a signal the Label itself should be "
+    "R, not a reason to write H with a low Score. If the Label is R or N the Score MUST be 0-5. "
+    "Within its band the Score is an independent judgement from the Level: Level "
+    "measures how much detail the author supplied, Score measures how usefully a reader could "
+    "answer. Two posts at the same Level must get different Scores when one is easier to answer "
+    "usefully than the other, and a short question can score high if it is precise. Spread your "
+    "scores across the band - do not default to the same digit for every helpful post.\n\n"
     "Think briefly inside " + "<think>" + "..." + "</think>" + ": at most two short sentences "
     "naming the dominant cue and your choice. Do not translate or restate the text.\n"
     "After closing the think tag, output EXACTLY these three lines and nothing else:\n"
@@ -345,6 +369,218 @@ TEACHER_PROMPT_ASSIST = (
     "1, 2, or 3; and Z is a single digit 0-9."
 )
 
+VALIDATION_PROMPT_ASSIST = (
+    DEFINITIONS_ASSIST
+    + "You must respond with EXACTLY ONE WORD: 'helpful', 'inert', or 'neutral'. "
+    "Do not include any explanations or punctuation."
+)
+
+
+# ---------------------------------------------------------------------------
+# virtue (intellectual-virtue vs dogmatism ranking axis)
+# ---------------------------------------------------------------------------
+#
+# A third ranking axis, independent of Locus-of-Control and of assist. The
+# polarity is EPISTEMIC CONDUCT: how does the author hold and handle a
+# contestable claim? Virtuous conduct = humility about one's own limits,
+# proportioned confidence, weighing competing considerations or values,
+# scoping claims instead of generalizing, engaging the strongest opposing
+# reading, naming what would change one's mind, publicly updating. Dogmatic
+# conduct = blanket statements about whole groups, certainty out of proportion
+# to the evidence, single-cause explanations, unfalsifiable framings,
+# strawmanning and motive attribution, contempt for anyone who disagrees.
+#
+# Deliberately NOT part of the axis: whether the claim is true, which side of
+# a dispute the author is on, and how politely it is phrased. A correct claim
+# asserted with contempt is dogmatic; a mistaken claim held tentatively with
+# reasons is virtuous.
+#
+# Known confound to watch in training: epistemic virtue correlates with
+# register and length (long, essayistic, academic posts). The synthetic
+# counterexample step (create_synthetic_counterexamples.py) matters more here
+# than on the other axes - it produces same-length, same-voice rewrites that
+# flip only the epistemic framing, which is what breaks the "nuance = long
+# words" shortcut the embedding would otherwise learn.
+#
+# Output format is identical to v4/assist (Label/Level/Score) so
+# annotate_lmstudio_soft_labels.py parses it unchanged.
+
+LETTER_TO_LABEL_VIRTUE = {"v": "virtuous", "d": "dogmatic", "n": "neutral"}
+LABELS_VIRTUE = ["virtuous", "dogmatic", "neutral"]
+
+DEFINITIONS_VIRTUE = (
+    "You are an expert analyst of reasoning quality, classifying social media posts by the "
+    "INTELLECTUAL VIRTUE OF THE AUTHOR'S CONDUCT: how the author holds and handles a "
+    "contestable claim. Does the post show humility, proportioned confidence, and the weighing "
+    "of competing considerations - or does it show dogmatism: blanket statements, unearned "
+    "certainty, and closure to any counter-argument? Posts may be in any language (often German "
+    "or English).\n\n"
+    "Judge the CONDUCT, never the position. You are not assessing whether the claim is true, "
+    "which side of a dispute the author is on, or whether you agree. A claim you consider "
+    "correct, asserted with contempt and without scope, is 'dogmatic'. A claim you consider "
+    "wrong, held tentatively and supported with reasons, is 'virtuous'. Political, religious, "
+    "and cultural positions of every kind are treated identically.\n\n"
+    "Scope: the axis only applies to posts that make or discuss a CONTESTABLE claim - something "
+    "a reasonable person could dispute. Chat, jokes, logistics, personal narrative, links, "
+    "announcements, plain factual reports, and questions carry no epistemic conduct and are "
+    "'neutral'.\n\n"
+    "Key Guidelines for Ambiguities:\n"
+    "1. Hedging Theater: a hedge counts only if it actually governs the claim. 'I might be "
+    "wrong, but they are all corrupt', 'just my opinion, but anyone who thinks X is an idiot', "
+    "'not all X, but X people always Y' are 'dogmatic' - the disclaimer is decoration on an "
+    "unscoped blanket claim. Genuine humility limits what is being asserted.\n"
+    "2. Nuance-Signalling vs Real Weighing: 'it's complicated', 'there are many sides to this', "
+    "'reality is messy' with nothing named is NOT virtuous - it is 'neutral' at best. Real "
+    "weighing names at least one specific consideration that cuts against the author's own "
+    "position, or two specific values in tension, and says how they trade off.\n"
+    "3. Register Is Not Virtue: academic vocabulary, citations, thread length, and calm tone do "
+    "not make a post virtuous; a long, well-written essay can be thoroughly 'dogmatic'. A short, "
+    "casual post can be 'virtuous' ('huh, i assumed the opposite - what am i missing?'). Judge "
+    "the epistemic move, not the prose.\n"
+    "4. Confidence Is Allowed: stating a firm conclusion is not dogmatic when the confidence is "
+    "backed by reasons and the claim is scoped to what those reasons support. Dogmatism is "
+    "UNEARNED absoluteness: no reasons, no scope, and no conceivable counter-evidence.\n"
+    "5. Disagreement Is Allowed: arguing forcefully against a named argument, with reasons, is "
+    "'virtuous' or 'neutral'. What makes disagreement 'dogmatic' is attacking the person or "
+    "imputing motives ('they only say this because they're paid to') instead of the argument, "
+    "strawmanning the opposing view, or treating disagreement itself as proof of bad faith.\n"
+    "6. Groups vs Actors: unscoped claims about a broad group ('X people are all Y', 'everyone "
+    "who votes Z is W') are the paradigm case of 'dogmatic'. A scoped claim about specific "
+    "actors and their documented actions is not dogmatic, however harsh.\n"
+    "7. Anecdote Scope: telling one's own experience as an experience is 'neutral'. Generalizing "
+    "one experience into a universal law ('this happened to me, which proves X always...') is "
+    "'dogmatic'. Noting the limits of one's own sample ('n=1, but...') is 'virtuous'.\n"
+    "8. Manufactured Doubt: uncertainty must be proportionate. Treating a well-established "
+    "matter as wide open, or demanding impossible proof in order to dismiss evidence, is not "
+    "humility - it is 'dogmatic' when it serves to shut an argument down, 'neutral' otherwise.\n"
+    "9. Facts and Values Both Count: calibration about evidence ('the data is thin, this could "
+    "go either way') and weighing values ('I want both the openness and the safety here and I "
+    "can't have all of both') are equally 'virtuous'.\n"
+    "10. Reporting Someone Else's Dogmatism: when a post quotes, screenshots, or replies to a "
+    "sweeping claim, classify the AUTHOR'S OWN conduct. A quote-post that only dunks is "
+    "'dogmatic'; one that engages what the quoted claim actually argues is 'virtuous'; one that "
+    "merely relays it without comment is 'neutral'.\n"
+    "11. Jokes and Hyperbole: comic exaggeration, satire, and obvious bits are 'neutral', not "
+    "dogmatic - unless the joke's payload is a serious unscoped claim about a group.\n"
+    "12. Questions: a question is not virtuous merely for being a question - whether a request "
+    "is answerable is a different axis entirely. A question is 'virtuous' only when it shows the "
+    "author reconsidering their own view ('what's the best argument against my position here?'); "
+    "rhetorical questions that assert a blanket claim ('how can anyone still believe X?') are "
+    "'dogmatic'; ordinary information-seeking questions are 'neutral'.\n"
+    "13. Updating: explicitly revising a stated prior position ('I argued the opposite last "
+    "year; this changed my mind because...') is the strongest form of the virtue. Vague "
+    "'I've grown a lot' with no content is 'neutral'.\n"
+    "14. Default to Neutral - this is the most important rule and the easiest to get wrong. "
+    "Before labelling a post 'dogmatic' you must be able to name the specific move that makes it "
+    "so: the unscoped claim about a whole group, the certainty asserted with no reasons, the "
+    "imputed motive, the contempt standing in for an argument, the framing no evidence could "
+    "touch. If you cannot name one, the label is 'neutral'. The following are NOT dogmatism, "
+    "however strongly worded: criticism of named actors and their specific actions; anger, "
+    "complaint, and venting; sarcasm or mockery aimed at a particular act rather than at a class "
+    "of people; taste claims and enthusiasm ('still the best series ever made'); hyperbole no "
+    "reader would take literally; hedged relays of rumour or reporting ('apparently they...'); "
+    "and plain factual reports of what someone did, even when the facts are selected to make a "
+    "point. Having a side is not a vice. Most posts on a political, moral, or cultural topic are "
+    "'neutral' on this axis, and an axis that fires on every heated political post is broken.\n\n"
+    "- 'virtuous': The post handles a contestable claim well: it acknowledges the limits of the "
+    "author's own knowledge or sample, proportions confidence to the evidence, scopes claims to "
+    "the cases they cover, weighs competing considerations or values against each other, engages "
+    "the strongest version of an opposing view, names what would change the author's mind, or "
+    "publicly updates a prior position. (Humble, calibrated, weighing, scoped, revisable).\n"
+    "- 'dogmatic': The post handles a contestable claim badly: blanket generalizations about "
+    "whole groups, certainty out of proportion to the evidence given, single-cause explanations "
+    "of complicated things, framings no evidence could ever contradict, strawmanning or motive "
+    "attribution, contempt or ridicule in place of argument, appeals to obviousness ('anyone can "
+    "see', 'the only explanation is'), or treating any disagreement as bad faith. One of these "
+    "moves must be identifiably present - strength of feeling alone is not enough. (Absolute, "
+    "unscoped, closed, contemptuous).\n"
+    "- 'neutral': Everything else, and this is the largest class by far: chat, jokes, logistics, "
+    "announcements, links, personal narrative, plain factual reports, ordinary questions, and any "
+    "post that makes no contestable claim - as well as posts that gesture at nuance without "
+    "naming any actual consideration, and opinionated posts that take a side, complain, or "
+    "criticise without committing any of the dogmatic moves listed above.\n"
+)
+
+TEACHER_PROMPT_VIRTUE = (
+    DEFINITIONS_VIRTUE
+    + "\nAdditionally, if the label is 'virtuous', you must assess the Depth of the epistemic "
+    "work on a 3-level scale:\n"
+    "- Level 1 (Stated): the virtue is asserted but not demonstrated - a tentative tone, 'I "
+    "could be wrong', 'I don't know enough about this', with no reasons or considerations "
+    "given.\n"
+    "- Level 2 (Demonstrated): at least one SPECIFIC counter-consideration, limitation, or "
+    "competing value is named, and it actually bears on the claim ('the study was self-reported, "
+    "so I only half trust it').\n"
+    "- Level 3 (Worked through): named considerations are weighed against each other and a "
+    "scoped conclusion is reached or explicitly declined - the strongest opposing case is "
+    "engaged, the evidence that would settle it is named, or a stated prior position is "
+    "revised.\n"
+    "If the label is 'dogmatic' or 'neutral', always output 'Level: 1'.\n\n"
+    "Additionally, you must rate the post's EPISTEMIC CARE on a single 0-9 Score. The Label and "
+    "the Score answer different questions. The Label asks a threshold question: does this post "
+    "cross into virtue or into dogmatism? The Score asks a continuous one: how carefully is the "
+    "claim held, compared to every other post you see? Most posts do not cross either threshold, "
+    "and they still differ enormously in care - that difference is exactly what the Score is "
+    "for.\n"
+    "- 0-1: unscoped blanket claims about groups, contempt or ridicule instead of argument, "
+    "unfalsifiable framings, disagreement treated as bad faith.\n"
+    "- 2-3: overgeneralization, certainty beyond the reasons given, single-cause explanation, "
+    "motive attribution, dunking, or hedging theater.\n"
+    "- 4: a claim or opinion asserted flatly, with no care shown and no dogmatic move committed "
+    "either - or a post with nothing to be careful about at all (chat, logistics, a bare link, an "
+    "announcement, a joke).\n"
+    "- 5: a claim held with visible ordinary caution - a reason given for it, a factual report "
+    "kept separate from the author's reading of it, a criticism scoped to a named actor and their "
+    "specific actions.\n"
+    "- 6: a TRACE of the virtue that falls short of the V threshold - a passing hedge that really "
+    "does limit the claim, a small concession to the other side, an acknowledged limit ('for me "
+    "anyway', 'at least in my corner of this'). Not virtuous enough to label V, but plainly more "
+    "careful than a flat assertion.\n"
+    "- 7: one specific limitation or counter-consideration is named, or the claim is explicitly "
+    "scoped to the cases it covers.\n"
+    "- 8: genuine weighing - two or more specific considerations traded off against each other, "
+    "or the strongest opposing case engaged on its merits.\n"
+    "- 9: self-implicating - a stated prior is revised, the evidence that would change the "
+    "author's mind is named, or a scoped conclusion is reached after weighing considerations that "
+    "cut against them.\n\n"
+    "The Score is NOT a function of the Label and must never be clipped to fit it. A post you "
+    "label N may score 6 or 7 when it shows real care that still falls short of the threshold - "
+    "do NOT push it down to 4 or 5 just because the Label came out N. Equally, do not inflate a "
+    "flat assertion to 6 because the topic is serious. Scores 8 and 9 describe posts that "
+    "genuinely weigh or revise, and those will normally also be labelled V; 0 and 1 are reserved "
+    "for the harshest dogmatism.\n"
+    "Discriminate carefully in the 4-to-7 range, which is where most posts live: distinguishing a "
+    "flat assertion (4) from a reasoned one (5) from one that concedes something (6) is the most "
+    "useful judgement you make. Never default to the same digit for every post that is not "
+    "obviously virtuous or dogmatic - a run of identical Scores means you have stopped "
+    "discriminating.\n\n"
+    "Think briefly inside " + "<think>" + "..." + "</think>" + ": at most two short sentences "
+    "naming the dominant cue and your choice. Do not translate or restate the text. Do not state "
+    "whether you agree with the author.\n"
+    "After closing the think tag, output EXACTLY these three lines and nothing else:\n"
+    "Label: X\n"
+    "Level: Y\n"
+    "Score: Z\n"
+    "where X is a single letter V (virtuous), D (dogmatic), or N (neutral); Y is a single digit "
+    "1, 2, or 3; and Z is a single digit 0-9."
+)
+
+VALIDATION_PROMPT_VIRTUE = (
+    DEFINITIONS_VIRTUE
+    + "You must respond with EXACTLY ONE WORD: 'virtuous', 'dogmatic', or 'neutral'. "
+    "Do not include any explanations or punctuation."
+)
+
+
+def axis_labels():
+    """Label set of the active axis: [positive, negative, neutral]."""
+    v = prompt_version()
+    if v == "assist":
+        return LABELS_ASSIST
+    if v == "virtue":
+        return LABELS_VIRTUE
+    return LABELS
+
 
 def prompt_version():
     return os.environ.get("LOC_PROMPT_VERSION", "v1")
@@ -352,6 +588,8 @@ def prompt_version():
 
 def get_teacher_prompt():
     v = prompt_version()
+    if v == "virtue":
+        return TEACHER_PROMPT_VIRTUE
     if v == "assist":
         return TEACHER_PROMPT_ASSIST
     if v == "v4":
@@ -363,6 +601,10 @@ def get_teacher_prompt():
 
 def get_validation_prompt():
     v = prompt_version()
+    if v == "virtue":
+        return VALIDATION_PROMPT_VIRTUE
+    if v == "assist":
+        return VALIDATION_PROMPT_ASSIST
     if v in ("v3", "v4"):
         return VALIDATION_PROMPT_V3
     return VALIDATION_PROMPT_V2 if v == "v2" else VALIDATION_PROMPT_V1
