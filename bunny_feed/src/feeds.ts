@@ -83,9 +83,12 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   threshold: 0.88,
 };
 
-// Note: feeds published under this did:web but absent here (fem-feed,
-// climate-optim) resolve to DEFAULT_FEED, which is the behavior they had before
-// this registry existed.
+// Note: only feeds whose record points at did:web:feedforward.b-cdn.net reach
+// this worker at all. The account also publishes climate-optim, but that record
+// names did:web:api.graze.social and is served entirely by Graze, so nothing
+// here applies to it. (fem-feed pointed at did:web:femfeed.b-cdn.net, whose
+// service was returning 502; the record was deleted 2026-09-07.) DEFAULT_FEED
+// therefore only ever catches a typo or an unpublished rkey.
 //
 // The assist axis ('helpful-feed') was tried and scrapped: GE's candidate pool
 // cannot supply enough genuine help requests to build on. It caps at 1000
