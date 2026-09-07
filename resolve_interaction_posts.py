@@ -12,7 +12,10 @@ from create_synthetic_counterexamples import teacher_annotate
 logging.basicConfig(level=logging.INFO)
 
 API_BASE = os.environ.get("LOC_API_BASE", "http://127.0.0.1:8080/v1")
-DISAGREEMENTS_LOG = "backend/disagreements_log.csv"
+# NOT backend/disagreements_log.csv - backend/main.py owns that one and writes a
+# different 5-column NLI-vs-vector schema to it.
+DISAGREEMENTS_LOG = os.environ.get(
+    "LOC_INTERACTION_DISAGREEMENTS", "backend/interaction_disagreements_log.csv")
 
 def main():
     load_dotenv()
@@ -29,14 +32,15 @@ def main():
     with open(interactions_file, 'r', encoding='utf-8') as f:
         interactions = json.load(f)
 
-    # We want to map requestLess to external (label=0.0)
+    # Explicit feedback and engagement both count: requestLess is the negative
+    # signal, requestMore plus like/repost/reply/quote the positive ones.
     target_interactions = []
     for inter in interactions:
         evt = inter.get('event')
         if evt == 'app.bsky.feed.defs#requestLess':
             label = 'external' # negative for this feed
             target_interactions.append((inter['item'], label))
-        elif evt in ['app.bsky.feed.defs#interactionLike', 'app.bsky.feed.defs#interactionRepost', 'app.bsky.feed.defs#interactionReply', 'app.bsky.feed.defs#interactionQuote']:
+        elif evt in ['app.bsky.feed.defs#requestMore', 'app.bsky.feed.defs#interactionLike', 'app.bsky.feed.defs#interactionRepost', 'app.bsky.feed.defs#interactionReply', 'app.bsky.feed.defs#interactionQuote']:
             label = 'internal' # positive for this feed
             target_interactions.append((inter['item'], label))
 
@@ -82,7 +86,8 @@ def main():
         
         writer = csv.writer(csvfile)
         if not file_exists:
-            writer.writerow(['URI', 'User Interaction', 'Teacher Label', 'Text'])
+            writer.writerow(['uri', 'user_interaction', 'teacher_label',
+                             'teacher_p_user_label', 'text'])
             
         for uri, user_label in uri_to_label.items():
             text = fetched_posts.get(uri)
@@ -92,8 +97,15 @@ def main():
                     lp, soft, teacher_label, lvl_lp, soft_lvl, loc_lvl = teacher_annotate(llm_client, text)
                     
                     if user_label != teacher_label:
-                        logging.warning(f"DISAGREEMENT on {uri}: User said {user_label}, Teacher said {teacher_label}")
-                        writer.writerow([uri, user_label, teacher_label, text])
+                        # The teacher now sets the training target, so these are the rows
+                        # where the user's own signal was overridden - log the teacher's
+                        # confidence in the user's label so they can be triaged by hand.
+                        p_user = float(soft.get(user_label, 0.0))
+                        logging.warning(f"DISAGREEMENT on {uri}: User said {user_label}, "
+                                        f"Teacher said {teacher_label} (p({user_label})={p_user:.3f})")
+                        writer.writerow([uri, user_label, teacher_label,
+                                         f"{p_user:.4f}", text])
+                        csvfile.flush()
                     
                     record = {
                         "uri": uri,
