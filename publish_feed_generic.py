@@ -11,7 +11,16 @@ feed in place (name/description) rather than creating a duplicate.
 
 Run:
   uv run --with atproto --with python-dotenv python publish_feed_generic.py \
-      --rkey helpful-feed --name "Helpful Feed" --description "..."
+      --rkey <rkey> --name "<name>" --description "..."
+
+This supersedes the old per-feed publish scripts. The one live feed's exact
+metadata, should it ever need republishing:
+
+  --rkey feed-forward --name "Feed Forward" --description \
+    "A feed powered by a vector classifier to filter for posts demonstrating \
+an internal locus of control."
+
+Pass --delete to unpublish instead.
 """
 
 import argparse

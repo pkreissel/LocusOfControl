@@ -99,13 +99,6 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
 // of that trained vector.
 export const FEEDS: Record<string, FeedConfig> = {
   'feed-forward': { rkey: 'feed-forward', name: 'Feed Forward', ...LOC },
-  // Same vector, but served identically to everyone (no personalization).
-  'selbstwirksamkeit': {
-    rkey: 'selbstwirksamkeit',
-    name: 'Selbstwirksamkeit',
-    ...LOC,
-    forcePublic: true,
-  },
 };
 
 // Requests for an unknown rkey still have to be answered with something, and the
@@ -123,8 +116,10 @@ export function resolveFeed(rkey: string): FeedConfig {
 // misses the cache we score it against ALL of these at once and store a row per
 // version, and a later request for a different feed finds it already cached
 // instead of paying Jina for the same text twice. Feeds sharing a vector
-// (feed-forward and selbstwirksamkeit) collapse to one entry here — writing the
-// same (uri, version) twice in one statement is an error, not a no-op.
+// collapse to one entry here — writing the same (uri, version) twice in one
+// statement is an error, not a no-op. With a single feed registered this is a
+// one-element list and the pass is a no-op; it earns its keep the moment a
+// second vector is added.
 export const ALL_SCORERS: Scorer[] = (() => {
   const byVersion = new Map<string, Scorer>();
   for (const f of Object.values(FEEDS)) {
