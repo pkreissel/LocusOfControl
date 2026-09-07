@@ -44,3 +44,6 @@ external_vector_meta.json
 old_vector.json
 old_metrics.txt
 reposts_analysis.json
+
+# Local backup copies of regenerable datasets
+*.bak
