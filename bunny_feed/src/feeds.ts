@@ -57,6 +57,17 @@ export type FeedConfig = {
    */
   candidateFilter?: RegExp;
   /**
+   * Minimum length a candidate must reach to be embedded at all, in words. Free
+   * like `candidateFilter`, and applied before it. A handful of words carries no
+   * readable position on any of these axes, so the score such a post gets is
+   * noise that the threshold then promotes or drops at random -- measured on a
+   * live pool, "overwhelmed" scored 0.901 and a row of four 👇 emoji scored
+   * 0.884, both comfortably over the 0.88 LoC gate. Dropping them early also
+   * saves their share of the Jina call. See hasEnoughText() in index.ts for how
+   * the count treats URLs, emoji and space-less scripts. Unset = no gate.
+   */
+  minWords?: number;
+  /**
    * What decides the final order. 'ge' hands survivors to GE's reranker (the
    * original behavior). 'score' orders by this feed's own vector score and
    * skips the rerank call — correct when the vector *is* the editorial
@@ -81,6 +92,13 @@ export type FeedConfig = {
 const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   scorer: createScorer(locVectorData as VectorData),
   threshold: 0.88,
+  // Locus of control is a claim about agency, and a post has to say something
+  // for that claim to be readable at all. Measured against a live 500-candidate
+  // pool: 6 words cuts the pool to 396 (23 of the drops had *empty* text, which
+  // was being embedded and scored) and the survivors still clear the 0.88 gate
+  // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
+  // Going to 8 buys little (245 through) and starts cutting real one-liners.
+  minWords: 6,
 };
 
 // Note: only feeds whose record points at did:web:feedforward.b-cdn.net reach

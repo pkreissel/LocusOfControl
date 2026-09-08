@@ -80,6 +80,29 @@ function getPublicBaseUrl(_requestUrl: URL): string {
 }
 
 type Candidate = { uri: string; cid?: string; text: string; minilm_l12_embedding?: string; [key: string]: any };
+
+// Length gate behind FeedConfig.minWords: is there enough text here to be worth
+// embedding? URLs are stripped first (a bare link says nothing the vector can
+// read), and a whitespace token only counts as a word if it holds a letter or
+// digit, so a row of emoji or ellipses counts as zero rather than several.
+//
+// The character escape hatch exists because whitespace tokenizing badly
+// undercounts scripts that don't delimit words with spaces: measured on a live
+// 500-candidate pool it rescued 10 posts the word count alone would have cut,
+// 7 of them substantial Japanese or Thai posts. Counting only letters and
+// digits keeps the escape from being opened by a wall of emoji.
+const URL_RE = /(?:https?:\/\/|www\.)\S+/g;
+const WORDY_RE = /[\p{L}\p{N}]/u;
+function hasEnoughText(text: string, minWords: number): boolean {
+  const stripped = (text || '').replace(URL_RE, ' ');
+  let words = 0, chars = 0;
+  for (const tok of stripped.split(/\s+/)) {
+    if (!WORDY_RE.test(tok)) continue;
+    words++;
+    for (const ch of tok) if (WORDY_RE.test(ch)) chars++;
+  }
+  return words >= minWords || chars >= minWords * 5;
+}
 type SkeletonBody = { feed: { post: string }[]; cursor?: string };
 
 const SKELETON_TTL_SEC = 60;
@@ -523,7 +546,7 @@ async function handleRequest(request: Request): Promise<Response> {
       tPrune = Date.now() - tS_start;
 
       const tC_start = Date.now();
-      let candRaw = 0;
+      let candRaw = 0, candShort = 0;
       try {
         const buildBody = (gens: { name: string; weight: number }[]) => {
           const b: any = {
@@ -580,12 +603,16 @@ async function handleRequest(request: Request): Promise<Response> {
         }
         candRaw = merged.length;
 
-        // Cheap text gate before any embedding. This is what makes a fanned-out
-        // pool affordable: the regex is free, Jina is not. Feeds without a
-        // filter keep the whole pool, exactly as before.
-        candidates = feedConfig.candidateFilter
-          ? merged.filter(c => feedConfig.candidateFilter!.test(c.text))
-          : merged;
+        // Cheap text gates before any embedding. This is what makes a fanned-out
+        // pool affordable: a regex and a word count are free, Jina is not.
+        // Feeds that configure neither keep the whole pool, exactly as before.
+        const minWords = feedConfig.minWords ?? 0;
+        candidates = merged.filter(c => {
+          // Length first, and counted separately, so the [feed] line reports how
+          // much of the pool is one-liners independently of the regex gate.
+          if (minWords > 0 && !hasEnoughText(c.text, minWords)) { candShort++; return false; }
+          return !feedConfig.candidateFilter || feedConfig.candidateFilter.test(c.text);
+        });
       } catch (err: any) {
         console.error("[getFeedSkeleton] GE generate fetch failed:", err?.message || String(err));
       }
@@ -739,7 +766,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       logFeed({
         feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
-        candRaw, cand: candidates.length, pass: rankedUris.length,
+        candRaw, candShort, cand: candidates.length, pass: rankedUris.length,
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
         gatherMs, ms: Date.now() - t0,
