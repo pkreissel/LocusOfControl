@@ -3,6 +3,7 @@ import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
 import { resolveFeed, ALL_SCORERS, type FeedConfig } from './feeds';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
+import { siteResponse } from './site';
 
 console.log("Bunny Edge Script module initialized");
 
@@ -857,5 +858,19 @@ async function handleRequest(request: Request): Promise<Response> {
     }), { headers: { 'Content-Type': 'application/json' } });
   }
 
+  // --- PUBLIC PAGE ---
+  // Everything above this point is machine-facing. A human who types the
+  // hostname into a browser gets the measurement notes instead: what the vector
+  // does to the emotional and civility profile of the posts it admits. Static
+  // and self-contained (see site.ts), so it costs no query, no upstream call and
+  // no latency the feed path could notice, and the PullZone may cache it hard.
+  if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/findings')) {
+    return siteResponse();
+  }
+
+  // Unknown paths keep answering 200 with the original plaintext banner rather
+  // than 404. describeFeedGenerator is not implemented here and lands in this
+  // branch, and some clients read a non-2xx from a feed generator as the service
+  // being down — so adding a page at `/` must not change what anything else gets.
   return new Response(`Bunny ATProto Feed Generator - Current time: ${new Date().toISOString()}`, { status: 200 });
 }
