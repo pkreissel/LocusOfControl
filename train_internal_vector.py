@@ -28,10 +28,21 @@ GEMINI_FILE = os.environ.get("LOC_VAL_FILE", "dataset_validation_gemini.jsonl")
 VAL_LABELS_FILE = os.environ.get("LOC_VAL_LABELS_FILE")  # optional uri->loc_label override
 INTERACTIONS_FILE = "dataset_interactions.jsonl"
 CACHE_LMSTUDIO_EMBS = os.environ.get("LOC_EMB_CACHE", "embeddings_lmstudio_soft_v3_jina.npz") # Updated cache name for v3
-CACHE_INTERACTIONS_EMBS = "embeddings_interactions_jina.npz"
+# Env-configurable like every other cache here: training in a different embedding
+# space (e.g. Green Earth's hydrated MiniLM vectors, built by embed_minilm.py)
+# needs *all three* caches redirected, and this one being hardcoded meant the
+# interaction rows silently arrived as 1024-dim Jina vectors.
+CACHE_INTERACTIONS_EMBS = os.environ.get("LOC_INT_EMB_CACHE", "embeddings_interactions_jina.npz")
 CACHE_GEMINI_EMBS = os.environ.get("LOC_VAL_EMB_CACHE", "embeddings_gemini_jina.npz")
 VECTOR_OUT = os.environ.get("LOC_VECTOR_OUT", "internal_vector.npy")
-EMBEDDING_MODEL = "jinaai/jina-embeddings-v5-text-small"
+# Identifies the space these embeddings live in. Recorded in the vector's
+# _meta.json and exported into bunny_feed/src/*.json, where it is the only
+# statement of which model a deployed vector may be scored against -- so it
+# must follow the cache actually being trained on, not the default. Set
+# LOC_EMBEDDING_MODEL / LOC_EMBEDDING_TASK when training on a cache built by
+# embed_minilm.py, or the artifact will claim to be a Jina vector.
+EMBEDDING_MODEL = os.environ.get("LOC_EMBEDDING_MODEL", "jinaai/jina-embeddings-v5-text-small")
+EMBEDDING_TASK = os.environ.get("LOC_EMBEDDING_TASK", "classification")
 
 # Determine label set from prompt version
 _PROMPT_VER = os.environ.get("LOC_PROMPT_VERSION", "v1")
@@ -497,11 +508,11 @@ def main():
         json.dump({"scale": float(np.linalg.norm(w)), "bias": float(b),
                    "temperature": best_T, "l2_reg": best_l2,
                    "embedding_model": EMBEDDING_MODEL,
-                   "embedding_task": "classification"}, f, indent=2)
+                   "embedding_task": EMBEDDING_TASK}, f, indent=2)
     with open(f"results_{stem}.json", "w") as f:
         json.dump({"sweep": all_results, "best": best_key,
                    "final_full_data": final}, f, indent=2)
-    print(f"\nSaved {VECTOR_OUT} (1024-dim, unit norm), {stem}_meta.json "
+    print(f"\nSaved {VECTOR_OUT} ({len(v)}-dim, unit norm), {stem}_meta.json "
           f"and results_{stem}.json")
 
 

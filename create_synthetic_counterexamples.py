@@ -10,12 +10,22 @@ is teacher-annotated locally (llama.cpp, v3 prompt) for real soft labels and lev
 Output: dataset_synthetic_counterexamples.jsonl (same schema as teacher files,
 uri suffixed with #synth). Resumable. Needs GAI_API in .env.
 
+Before the first Gemini call the script prints a pre-flight report on the mined
+hard set (composition, expected land rate, expected usable rows, a sample to
+eyeball). It costs no API calls. LOC_SYNTH_PREFLIGHT controls it:
+  report  (default) print the diagnosis and generate anyway
+  gate    abort with exit code 2 if the lure side looks unrewritable
+  only    print the diagnosis and exit 0 without generating
+  off     skip it
+
 Run: uv run --with numpy --with openai --with google-genai --with python-dotenv \
      --with tqdm python create_synthetic_counterexamples.py
 """
 
 import json
 import os
+import re
+import sys
 import time
 
 import numpy as np
@@ -37,6 +47,38 @@ OUT = os.environ.get("LOC_SYNTH_OUT", "dataset_synthetic_counterexamples.jsonl")
 MODEL = os.environ.get("LOC_TEACHER_MODEL", "meta/muse-glimmer")
 API_BASE = os.environ.get("LOC_API_BASE", "http://127.0.0.1:8080/v1")
 N_PER_SIDE = int(os.environ.get("LOC_SYNTH_PER_SIDE", "100"))
+# Minimum spacing between Gemini calls (free tier: 15 RPM).
+GEMINI_MIN_INTERVAL = 4.1
+# report (default) = print the pre-flight and generate anyway; gate = abort if the
+# lure side looks unrewritable; only = print and exit without generating; off = skip.
+PREFLIGHT_MODE = os.environ.get("LOC_SYNTH_PREFLIGHT", "report").strip().lower()
+PREFLIGHT_SAMPLE = int(os.environ.get("LOC_SYNTH_PREFLIGHT_SAMPLE", "8"))
+# Judgment call, NOT a validated cutoff. Report section 8 lists lure-side agent
+# pronoun rate among the three signals that FAILED to discriminate: 54% on the Jina
+# run that gained +0.020 AUC, 47% on the MiniLM run that gained +0.001. No threshold
+# can separate those. Two further reasons not to read this as a decision rule: the
+# narrow pronoun list below scores that same MiniLM lure set at 34%, not 47%, so the
+# absolute number moves with the inventory used; and the corpus base rate it should
+# be read against moves with the corpus (29% here, 31% in the report).
+# 0.25 is therefore set *below the corpus base rate*, so `gate` only fires when the
+# mined lures are actively depleted of first person relative to the corpus at large -
+# the signature of the category error in section 7.1 (agentic vocabulary in agent-free
+# text), where rewriting has nothing to work with. It is a tripwire, not a decision.
+PREFLIGHT_MIN_PRONOUN = float(os.environ.get("LOC_SYNTH_PREFLIGHT_MIN_PRONOUN", "0.25"))
+
+# Measured land rates (teacher label == rewrite target) from the 199-row MiniLM run
+# and the Jina run before it: lures carrying a first-person agent 85%, lures without
+# one 68%, misses 95% either way. The 68% failures come back labelled `neutral` -
+# near-duplicates of their source that dilute the training set rather than teach it.
+LAND_LURE_AGENT = 0.85
+LAND_LURE_NO_AGENT = 0.68
+LAND_MISS = 0.95
+
+# First-person agent pronouns, English and German. Deliberately narrow: this is the
+# "is there anybody in this post to give agency to" probe from report section 7.1,
+# not a full pronoun inventory.
+AGENT_PRONOUNS = re.compile(
+    r"\b(i|my|me|we|our|us|ich|mir|mein|meine|wir|uns|unser)\b", re.IGNORECASE)
 
 
 # Detect if we are in assist mode
@@ -189,6 +231,96 @@ def teacher_annotate(client, text):
     raise ValueError("annotation failed after retries")
 
 
+def has_agent(text):
+    return bool(AGENT_PRONOUNS.search(text or ""))
+
+
+def preflight(rows, lure_idx, miss_idx, budget):
+    """Print what the mined hard set looks like before any Gemini call is made.
+
+    Everything here is computed from data already in memory, so it costs nothing.
+    It answers the one question report section 8 says to ask before spending quota:
+    could these posts plausibly have been written the other way? There is no
+    validated cheap predictor of payoff - the three that were tested (upweighting the
+    mined hard posts, corpus-level agent-pronoun rate, cross-space error overlap) all
+    failed to separate the Jina run that gained +0.020 AUC from the MiniLM run that
+    gained +0.001. What is reported below is composition and expected yield, which
+    bound how many rows are usable; they do NOT predict whether the rows help.
+
+    Returns the lure-side agent-pronoun fraction so the caller can gate on it.
+    """
+    base_rate = sum(has_agent(r["text"]) for r in rows) / max(len(rows), 1)
+    lure_agent = [i for i in lure_idx if has_agent(rows[i]["text"])]
+    lure_frac = len(lure_agent) / len(lure_idx) if lure_idx else 0.0
+
+    print("\npre-flight (no API calls; report section 8)")
+    print(f"  corpus base rate, first-person agent pronoun: {base_rate:.0%} "
+          f"of {len(rows)} posts")
+    print(f"  lures  with agent pronoun: {len(lure_agent)}/{len(lure_idx)} "
+          f"({lure_frac:.0%}, {100 * (lure_frac - base_rate):+.0f}pt vs corpus)")
+    print(f"  misses with agent pronoun: "
+          f"{sum(1 for i in miss_idx if has_agent(rows[i]['text']))}/{len(miss_idx)} "
+          f"(not predictive: the miss side lands {LAND_MISS:.0%} either way)")
+
+    # Expected usable rows: the lure side splits by agent pronoun, the miss side does
+    # not. Scale to the remaining budget, since the run is resumable.
+    n_hard = len(lure_idx) + len(miss_idx)
+    exp_land = (len(lure_agent) * LAND_LURE_AGENT
+                + (len(lure_idx) - len(lure_agent)) * LAND_LURE_NO_AGENT
+                + len(miss_idx) * LAND_MISS)
+    exp_rate = exp_land / n_hard if n_hard else 0.0
+    print(f"  expected land rate {exp_rate:.0%} "
+          f"(lure {LAND_LURE_AGENT:.0%} with agent / {LAND_LURE_NO_AGENT:.0%} without, "
+          f"miss {LAND_MISS:.0%})")
+    print(f"  expected usable rows: ~{round(exp_rate * budget)} of {budget} to generate "
+          f"(~{budget * 28 / 60:.0f} min, {budget} Gemini calls; free tier is 500/day)")
+    if USE_ASSIST:
+        print("  note: those land rates were measured on the LoC axis; on this axis "
+              "they are an extrapolation")
+
+    print("\n  sample of the mined hard set - ask of each: could this post plausibly "
+          "have been written the other way?")
+    # Interleave the two sides and stride through each so the sample is not just the
+    # most extreme rows; section 8 says to eyeball ~20, this prints a starting handful.
+    sample = []
+    for side, idx in (("lure", lure_idx), ("miss", miss_idx)):
+        take = max(PREFLIGHT_SAMPLE // 2, 1)
+        step = max(len(idx) // take, 1) if idx else 1
+        sample += [(side, i) for i in idx[::step][:take]]
+    for side, i in sample:
+        text = " ".join((rows[i]["text"] or "").split())
+        agent = "agent" if has_agent(text) else "no-agent"
+        print(f"    [{side}/{agent:8s}] {text[:150]}")
+
+    print("\n  caveats that no pre-flight number can cover:")
+    print("    - payoff tracked baseline headroom, not composition: Jina at val AUC "
+          "0.772 gained +0.020, MiniLM at 0.795 gained +0.001. Ask first whether this "
+          "probe is visibly worse than a sibling probe on the same data.")
+    print("    - rewrite yield does not predict payoff: the MiniLM batch landed 84% "
+          "and still moved AUC by +0.001.")
+    print("    - after retraining, check the external-leak column, not just AUC. Every "
+          "counterexample run moved external suppression, twice for the worse "
+          "(+0.036, +0.061, P(worse) = 1.000).")
+    print("    - counterexamples never transfer between embedding spaces or axes; "
+          "these rows are only valid for " + os.path.basename(VECTOR) + ".")
+
+    if lure_frac < PREFLIGHT_MIN_PRONOUN:
+        verdict = (f"VERDICT: lure side looks unrewritable - only {lure_frac:.0%} of the "
+                   f"lures have a first-person agent to make agentic. A lure set of "
+                   f"headlines and product announcements means a category error "
+                   f"(agentic vocabulary in agent-free text); the fix is more real "
+                   f"negatives of that category, not rewrites of them.")
+    else:
+        verdict = (f"VERDICT: lure side is rewritable in principle ({lure_frac:.0%} carry "
+                   f"an agent pronoun) - expect ~{round(exp_rate * budget)} usable rows. "
+                   f"This bounds yield, not payoff; headroom decides payoff.")
+        if lure_frac <= base_rate:
+            verdict += (" Note the lures are no more first-person than the corpus, so "
+                        "the sample above is doing the real work here.")
+    print("\n  " + verdict)
+    return lure_frac
+
+
 def main():
     val_uris = {r["uri"] for r in load_jsonl("dataset_validation_gemini.jsonl")}
     rows = [r for r in load_jsonl(TEACHER_FILE)
@@ -221,6 +353,19 @@ def main():
     print(f"hard posts: {len(lure_idx)} lures, {len(miss_idx)} misses")
 
     done = {r["uri"] for r in load_jsonl(OUT)} if os.path.exists(OUT) else set()
+
+    if PREFLIGHT_MODE != "off":
+        remaining = sum(1 for i, t in hard if rows[i]["uri"] + f"#synth-{t}" not in done)
+        lure_frac = preflight(rows, lure_idx, miss_idx, remaining)
+        if PREFLIGHT_MODE == "only":
+            return
+        if PREFLIGHT_MODE == "gate" and lure_frac < PREFLIGHT_MIN_PRONOUN:
+            print("\naborting: LOC_SYNTH_PREFLIGHT=gate and the lure side is below the "
+                  f"{PREFLIGHT_MIN_PRONOUN:.0%} agent-pronoun tripwire. Set "
+                  "LOC_SYNTH_PREFLIGHT=report to generate anyway.")
+            sys.exit(2)
+
+    last_gemini = 0.0  # monotonic timestamp of the last Gemini call; see the pacing below
     client = OpenAI(base_url=API_BASE, api_key="test-key")
     load_dotenv()
     gclient = genai.Client(api_key=os.environ["GAI_API"])
@@ -230,7 +375,15 @@ def main():
             if uri in done:
                 continue
             try:
-                time.sleep(4.1)  # Gemini free tier: 15 RPM
+                # Gemini's free tier allows 15 RPM. Pace against the *previous* call
+                # rather than sleeping unconditionally: teacher_annotate() below runs
+                # a 30B model locally and already holds this loop near 2 RPM, so a
+                # fixed 4.1s sleep was pure dead time (~14% of the run). It still
+                # blocks properly if the teacher ever gets fast enough to matter.
+                wait = GEMINI_MIN_INTERVAL - (time.monotonic() - last_gemini)
+                if wait > 0:
+                    time.sleep(wait)
+                last_gemini = time.monotonic()
                 r = gclient.models.generate_content(
                     model="gemini-3.1-flash-lite",
                     contents=f"Post:\n{rows[i]['text'][:2000]}",
