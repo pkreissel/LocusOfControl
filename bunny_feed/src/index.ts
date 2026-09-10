@@ -1,5 +1,7 @@
 import { jwtDecode } from 'jwt-decode';
 import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
+import { decodeEmbedding } from './minilm';
+import { fuseByRank } from './fuse';
 import { resolveFeed, ALL_SCORERS, type FeedConfig } from './feeds';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
@@ -27,6 +29,14 @@ function errChain(e: any): string {
 
 // Maximum number of candidates to send to the final GE reranker (rank/predict)
 const MAX_RERANK_CANDIDATES = 100;
+
+// Minimum share of candidates that must carry a hydrated embedding before the free
+// prefilter is trusted with the pool. Measured coverage after the text gates was
+// 100% (every un-hydrated candidate had empty text, which minWords already drops),
+// so this only ever fires if GE changes what it returns — in which case the request
+// pays for the old single-stage path instead of serving a feed ranked on a fraction
+// of the pool.
+const MIN_HYDRATION_COVERAGE = 0.8;
 
 // Weight of the Jina vector-similarity signal in GE's reranker, relative to the
 // two_tower model (fixed at 1.0). We stash each surviving candidate's similarity
@@ -80,7 +90,16 @@ function getPublicBaseUrl(_requestUrl: URL): string {
   return DEFAULT_PUBLIC_BASE_URL;
 }
 
-type Candidate = { uri: string; cid?: string; text: string; minilm_l12_embedding?: string; [key: string]: any };
+type Candidate = {
+  uri: string; cid?: string; text: string;
+  /** Base64 embedding from GE's hydrate_embeddings; see minilm.ts. */
+  minilm_l12_embedding?: string;
+  /** Free prefilter score, kept so fuseByRank can read it back. */
+  minilmScore?: number | null;
+  /** Paid score for the same post. Null means its Jina chunk failed. */
+  jinaScore?: number | null;
+  [key: string]: any;
+};
 
 // Length gate behind FeedConfig.minWords: is there enough text here to be worth
 // embedding? URLs are stripped first (a bare link says nothing the vector can
@@ -465,7 +484,7 @@ async function handleRequest(request: Request): Promise<Response> {
               // Never let the PullZone CDN cache the personalized skeleton (keys on
               // neither cursor nor DID). Our own per-key stores handle caching.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'score-cache-1',
+              'X-Feed-Version': 'minilm-prefilter-1',
             },
           });
         }
@@ -501,7 +520,7 @@ async function handleRequest(request: Request): Promise<Response> {
               // Same reasoning as the other personalized paths: keep the PullZone
               // CDN out of it; our per-user session store already caches.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'score-cache-1',
+              'X-Feed-Version': 'minilm-prefilter-1',
             },
           });
         }
@@ -548,6 +567,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       const tC_start = Date.now();
       let candRaw = 0, candShort = 0;
+      let preHydrated = 0, preKept = 0, preFellBack = false;
       try {
         const buildBody = (gens: { name: string; weight: number }[]) => {
           const b: any = {
@@ -558,7 +578,14 @@ async function handleRequest(request: Request): Promise<Response> {
             // Restrict candidates to the last 3 days. GE's allowed values are
             // 6/12/24/48/72/168; the infill generator inherits this window too,
             // so it can't widen eligibility.
-            max_age_hours: 72
+            max_age_hours: 72,
+            // Return each candidate's MiniLM embedding so the prefilter can rank
+            // the whole pool without paying Jina (see minilm.ts). Measured free:
+            // 500 candidates came back in 1.4-2.2s hydrated against 3.0-3.3s not,
+            // at the cost of ~2KB of base64 each. Always requested, even for feeds
+            // with no prefilter configured, so that a feed can be switched over in
+            // feeds.ts alone -- and so this stays one code path to reason about.
+            hydrate_embeddings: true
           };
           // Only send the key when non-empty so the unauthenticated path stays
           // byte-identical to before and we never send an empty array.
@@ -624,8 +651,43 @@ async function handleRequest(request: Request): Promise<Response> {
 
       if (candidates.length > 0) {
         const tE_start = Date.now();
-        // (3) Reuse cached scores; only cache-missed posts are sent to Jina.
-        const scored = await scoreCandidates(candidates, apiKey, feedConfig);
+
+        // (3a) Free first pass. Rank the WHOLE pool on GE's hydrated embeddings and
+        // keep only a shortlist, so the billed stage below sees ~150 candidates
+        // instead of every survivor of the text gates. Costs one dot product each
+        // (~5us; 4000 candidates measured at ~20ms total), no API call, no cache.
+        let paidPool = candidates;
+        let miniScores: (number | null)[] | null = null;
+        const pf = feedConfig.prefilter;
+        if (pf) {
+          const mini = candidates.map(c => {
+            const e = decodeEmbedding(c.minilm_l12_embedding);
+            return e ? pf.scorer.score(e).probability : null;
+          });
+          preHydrated = mini.reduce((n: number, m) => n + (m === null ? 0 : 1), 0);
+          // Coverage check, not an assumption. Every candidate seen without an
+          // embedding in testing had *empty* text and was already dropped by
+          // minWords, so real coverage after the gates was 100% -- but if GE ever
+          // stops hydrating, silently prefiltering on a handful of embeddings would
+          // empty the feed. Below the floor we fall back to the original
+          // single-stage path: more expensive, and correct.
+          if (preHydrated >= candidates.length * MIN_HYDRATION_COVERAGE) {
+            const kept = candidates
+              .map((c, i) => ({ c, p: mini[i] }))
+              .filter(x => x.p !== null && x.p >= pf.threshold)
+              .sort((a, b) => (b.p as number) - (a.p as number))
+              .slice(0, pf.shortlist);
+            paidPool = kept.map(x => x.c);
+            miniScores = kept.map(x => x.p);
+            preKept = paidPool.length;
+          } else {
+            preFellBack = true;
+            console.error(`[getFeedSkeleton] prefilter disabled: only ${preHydrated}/${candidates.length} candidates hydrated`);
+          }
+        }
+
+        // (3b) Reuse cached scores; only cache-missed posts are sent to Jina.
+        const scored = await scoreCandidates(paidPool, apiKey, feedConfig);
         embedHits = scored.hits;
         embedMisses = scored.misses;
         embedChunks = scored.chunks;
@@ -638,18 +700,32 @@ async function handleRequest(request: Request): Promise<Response> {
             console.error("[getFeedSkeleton] failed to record token usage:", errChain(e)))
         );
 
-        for (let i = 0; i < candidates.length; i++) {
+        for (let i = 0; i < paidPool.length; i++) {
           const p = scored.scores[i];
-          if (p !== null && p >= feedConfig.threshold) {
+          if (miniScores) {
+            // Already selected by the free pass, so `threshold` is not applied a
+            // second time here: it gates the Jina distribution, and re-gating a
+            // shortlist that was chosen on a different vector would just discard
+            // the disagreements this feed is paying Jina to hear. A null score is
+            // a failed Jina chunk rather than a rejection, so the candidate stays
+            // and is ranked on its free score alone.
+            paidPool[i].minilmScore = miniScores[i];
+            paidPool[i].jinaScore = p;
             // Overwrite the generator's popularity `score` (unused after ranking)
             // with the vector-similarity probability so GE's `candidate_score`
             // model can blend it into the final rank order (see RANK_SIM_WEIGHT).
-            candidates[i].score = p;
-            filteredCandidates.push(candidates[i]);
+            paidPool[i].score = p ?? miniScores[i] ?? 0;
+            filteredCandidates.push(paidPool[i]);
+          } else if (p !== null && p >= feedConfig.threshold) {
+            paidPool[i].score = p;
+            filteredCandidates.push(paidPool[i]);
           }
         }
-        
+
         // Sort descending by vector probability and enforce maximum limit
+        if (miniScores && feedConfig.fuse) {
+          fuseByRank(filteredCandidates);
+        }
         filteredCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
         if (filteredCandidates.length > MAX_RERANK_CANDIDATES) {
           filteredCandidates.length = MAX_RERANK_CANDIDATES;
@@ -774,6 +850,7 @@ async function handleRequest(request: Request): Promise<Response> {
         tSeen, tPrune, tCand, tEmbed, tRank, tStore,
         cacheHit: embedHits, cacheMiss: embedMisses,
         jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
+        preHydrated, preKept, preFellBack: preFellBack ? 'y' : 'n',
         waitUntil: hasWaitUntil() ? 'y' : 'n'
       });
 
@@ -791,13 +868,17 @@ async function handleRequest(request: Request): Promise<Response> {
           // X-Feed-Version confirms which build is actually serving traffic;
           // X-Ranked-Count is the full frozen list length; X-Exclude-Count reports
           // how many seen-post URIs were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'score-cache-1',
+          'X-Feed-Version': 'minilm-prefilter-1',
           'X-Ranked-Count': String(rankedUris.length),
           'X-Exclude-Count': String(excludeUris.length),
           // Score-cache diagnostics: hits/misses tell you whether the cache is warming
           // at all, and jina=<chunks> how far the miss batch fanned out. A warm
           // feed shows m=0 (or only genuinely new posts) on a repeat request.
           'X-Score-Cache': `h=${embedHits} m=${embedMisses} jina=${embedChunks}${embedFailedChunks ? ` fail=${embedFailedChunks}` : ''}`,
+          // Prefilter diagnostics: how many candidates arrived hydrated, how many
+          // survived into the paid stage, and whether coverage was too low to
+          // prefilter at all (fb=y means this request paid the old full price).
+          'X-Prefilter': `hyd=${preHydrated} kept=${preKept} fb=${preFellBack ? 'y' : 'n'}`,
           // Whether deferred (post-response) work is actually supported here; if
           // this reads 'n', prunes and token accounting are silently no-ops.
           'X-Wait-Until': hasWaitUntil() ? 'y' : 'n',

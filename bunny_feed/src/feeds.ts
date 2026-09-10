@@ -1,5 +1,6 @@
 import { createScorer, type Scorer, type VectorData } from './vector';
 import locVectorData from './vector.json';
+import locMinilmVectorData from './vector_minilm.json';
 
 // --- Feed registry ---------------------------------------------------------
 //
@@ -75,6 +76,37 @@ export type FeedConfig = {
    * independently of it (measured Spearman 0.277 against the assist score).
    */
   rankBy?: 'ge' | 'score';
+  /**
+   * Free first-pass ranking over Green Earth's hydrated MiniLM embeddings, so the
+   * paid Jina stage only ever sees a shortlist.
+   *
+   * This is not a cheap approximation of the Jina vector. Trained on the same rows
+   * through the same harness, the MiniLM probe matched it on held-out validation
+   * (AUC 0.795 vs 0.794) and beat it on live posts judged blind by the validation
+   * prompt: 62% internal in its top 50 against Jina's 42%. What it is worse at is
+   * suppressing the negative pole (12% external vs 2%), and the two agree only at
+   * Spearman 0.46 — which is exactly why `fuse` below is worth the Jina call.
+   * Full evidence: REPORT_ge_embeddings.md.
+   *
+   * Leave undefined to keep the original single-stage behaviour, and note the
+   * request falls back to it automatically if hydration stops arriving.
+   */
+  prefilter?: {
+    /** Scorer built from a vector trained in the MiniLM space (see embed_minilm.py). */
+    scorer: Scorer;
+    /** Minimum calibrated probability, on THIS vector's distribution. Not portable. */
+    threshold: number;
+    /** How many survivors reach the paid stage. This is the whole cost control. */
+    shortlist: number;
+  };
+  /**
+   * Order the shortlist by the mean of its two normalised ranks (MiniLM and Jina)
+   * rather than by either score alone. Measured on the validation set, fusion beat
+   * both single spaces (AUC 0.826 vs 0.795/0.794, external leak 0.245 vs
+   * 0.264/0.286) and on live posts it held MiniLM's 62% internal while cutting the
+   * external leak from 12% to 6%. Ignored unless `prefilter` is set.
+   */
+  fuse?: boolean;
 };
 
 // Locus-of-control axis: posts showing agency over posts showing helplessness.
@@ -99,6 +131,24 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
   // Going to 8 buys little (245 through) and starts cutting real one-liners.
   minWords: 6,
+  // Ranks every candidate for free over GE's hydrated embeddings, then hands only
+  // the top `shortlist` to Jina. 0.9356 is the 80th percentile of this vector's
+  // probability over 2143 live candidates -- i.e. "keep the top 20%" -- measured on
+  // its own distribution, which is the only way any of these thresholds mean
+  // anything. It is a floor, not the selector: `shortlist` does the real cutting,
+  // and the threshold only stops a thin pool from promoting obvious rejects.
+  //
+  // 150 was chosen against MAX_RERANK_CANDIDATES (100) with room for Jina chunk
+  // failures. On the labelled corpus a 20% prefilter preserved 90% of the top 30
+  // that full fusion over everything would have chosen, and precision@30 was flat
+  // from 15% upward -- the shortlist is not where quality is lost. It cuts the
+  // paid stage from ~364 embeddings per uncached request to <=150.
+  prefilter: {
+    scorer: createScorer(locMinilmVectorData as VectorData),
+    threshold: 0.9356,
+    shortlist: 150,
+  },
+  fuse: true,
 };
 
 // Note: only feeds whose record points at did:web:feedforward.b-cdn.net reach

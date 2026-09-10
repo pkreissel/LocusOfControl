@@ -17,8 +17,13 @@ export type VectorData = {
 };
 
 export type Scorer = {
-  /** Cosine + calibrated sigmoid probability for one embedding. */
-  score(embedding: number[]): { cosine: number; probability: number };
+  /**
+   * Cosine + calibrated sigmoid probability for one embedding.
+   *
+   * ArrayLike, not number[]: embeddings reach us either as a JSON array (Jina) or
+   * as a Float32Array decoded from Green Earth's hydrated blob (see minilm.ts).
+   */
+  score(embedding: ArrayLike<number>): { cosine: number; probability: number };
   /** Fingerprint of this vector's parameters; see VECTOR_VERSION below. */
   version: string;
 };
@@ -28,7 +33,7 @@ export function createScorer(data: VectorData): Scorer {
   const SCALE = data.scale;
   const BIAS = data.bias;
 
-  function score(embedding: number[]): { cosine: number; probability: number } {
+  function score(embedding: ArrayLike<number>): { cosine: number; probability: number } {
     // L2 normalize
     let norm = 0;
     for (let i = 0; i < embedding.length; i++) {
