@@ -1,0 +1,90 @@
+{
+  "valence_spearman": 0.32880775949080815,
+  "ridge_cv_r2": 0.1306805596617322,
+  "ridge_cv_spearman": 0.35878875539400895,
+  "within_teacher_label": [
+    {
+      "loc_label": "internal",
+      "n_pool": 258,
+      "keep_rate": 0.6821705426356589,
+      "emotions": {
+        "anger": {
+          "pool_pct": 13.178294573643413,
+          "admitted_pct": 7.954545454545454
+        },
+        "fear": {
+          "pool_pct": 5.038759689922481,
+          "admitted_pct": 2.272727272727273
+        },
+        "joy": {
+          "pool_pct": 2.3255813953488373,
+          "admitted_pct": 2.840909090909091
+        },
+        "love": {
+          "pool_pct": 5.426356589147287,
+          "admitted_pct": 6.25
+        },
+        "gratitude": {
+          "pool_pct": 1.937984496124031,
+          "admitted_pct": 2.840909090909091
+        }
+      }
+    },
+    {
+      "loc_label": "neutral",
+      "n_pool": 2577,
+      "keep_rate": 0.5172681412495149,
+      "emotions": {
+        "anger": {
+          "pool_pct": 4.501358168412883,
+          "admitted_pct": 3.3758439609902475
+        },
+        "fear": {
+          "pool_pct": 2.949165696546372,
+          "admitted_pct": 2.175543885971493
+        },
+        "joy": {
+          "pool_pct": 3.686457120682965,
+          "admitted_pct": 5.55138784696174
+        },
+        "love": {
+          "pool_pct": 3.6476523088863018,
+          "admitted_pct": 5.476369092273068
+        },
+        "gratitude": {
+          "pool_pct": 1.086534730306558,
+          "admitted_pct": 1.8004501125281318
+        }
+      }
+    },
+    {
+      "loc_label": "external",
+      "n_pool": 1532,
+      "keep_rate": 0.22780678851174935,
+      "emotions": {
+        "anger": {
+          "pool_pct": 18.01566579634465,
+          "admitted_pct": 17.765042979942695
+        },
+        "fear": {
+          "pool_pct": 11.488250652741515,
+          "admitted_pct": 7.4498567335243555
+        },
+        "joy": {
+          "pool_pct": 0.39164490861618795,
+          "admitted_pct": 1.4326647564469914
+        },
+        "love": {
+          "pool_pct": 1.1749347258485638,
+          "admitted_pct": 2.292263610315186
+        },
+        "gratitude": {
+          "pool_pct": 0.8485639686684074,
+          "admitted_pct": 2.865329512893983
+        }
+      }
+    }
+  ],
+  "internal_angry_mean_prob": 0.8644947352742066,
+  "internal_not_angry_mean_prob": 0.8937546511644899
+}
