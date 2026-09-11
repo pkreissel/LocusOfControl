@@ -104,3 +104,65 @@ export const feedInteractions = sqliteTable('feed_interactions', {
   // cheap to maintain even though "shown" rows are now the insert firehose.
   index('feed_interactions_event_created_at_idx').on(t.event, t.createdAt),
 ]);
+
+
+// One row per getFeedSkeleton request: the same `[feed]` line console.log already
+// emits, kept somewhere it can be queried and aggregated.
+//
+// Console output answers "what happened on that request"; this table answers the
+// questions that are actually worth asking — what the 99th percentile looks like,
+// which stage owns the slow tail, how often GE comes back empty, whether a bad
+// minute was Jina or the ranker. Each stage timer is its own column so that is a
+// GROUP BY rather than a log grep.
+//
+// READ THE ABSENCES. The row is written at the end of the request, so a request
+// that never finished has no row at all: a hard stall shows up as a gap in `ts`,
+// not as a slow row. That is exactly why the upstream calls carry deadlines
+// (GE_*_TIMEOUT_MS / JINA_TIMEOUT_MS in index.ts) — a deadline converts a hang
+// into an ordinary handled failure, which finishes the request and therefore
+// lands here with `errors` set. Anything that outlives those deadlines is the
+// platform killing the isolate, and only the gap will show it.
+//
+// Pruned opportunistically like the other tables; see FEED_LOG_RETENTION_MS.
+export const feedLogs = sqliteTable('feed_logs', {
+  id: text('id').primaryKey(),                    // crypto.randomUUID()
+  ts: integer('ts').notNull(),                    // unix ms, written at request end
+  feed: text('feed').notNull(),                   // rkey, so feeds can be compared
+  did: text('did'),                               // truncated as logged; 'anon' when public
+  cache: text('cache'),                           // 'hit' | 'miss'
+  page: text('page'),                             // 'fresh' | 'cont' | 'reuse' (null on a hit)
+  personalized: text('personalized'),             // 'true'/'false', and null on a hit whose
+  path: text('path'),                             //   cached body predates these markers
+  ms: integer('ms'),                              // whole request
+  gatherMs: integer('gather_ms'),                 // candidate gather (GE generate + text gates)
+  tSeen: integer('t_seen'),                       // per-stage timers, each its own column so
+  tPrune: integer('t_prune'),                     //   the slow tail can be attributed without
+  tCand: integer('t_cand'),                       //   parsing anything
+  tEmbed: integer('t_embed'),
+  tRank: integer('t_rank'),
+  tStore: integer('t_store'),
+  candRaw: integer('cand_raw'),                   // GE returned (0 = empty pool: an empty feed)
+  candShort: integer('cand_short'),               // dropped by minWords
+  cand: integer('cand'),                          // survived the free text gates
+  pass: integer('pass'),                          // length of the frozen ranked list
+  off: integer('off'),                            // page window into that list
+  pageLimit: integer('page_limit'),               // `limit` is reserved in SQL
+  feedLen: integer('feed_len'),                   // posts actually served on this page
+  nextCursor: text('next_cursor'),                // 'y'/'n' — whether the feed continued
+  cacheHit: integer('cache_hit'),                 // score-cache hits / misses, i.e. what the
+  cacheMiss: integer('cache_miss'),               //   Jina bill looked like
+  jinaChunks: integer('jina_chunks'),
+  jinaFailed: integer('jina_failed'),
+  preHydrated: integer('pre_hydrated'),           // prefilter: pool that carried an embedding,
+  preKept: integer('pre_kept'),                   //   how many reached the paid stage, and
+  preFloor: real('pre_floor'),                    //   where the rank cut landed
+  preFellBack: text('pre_fell_back'),             // 'y' = coverage too low, paid the full price
+  waitUntil: text('wait_until'),                  // 'n' = no waitUntil here, so this row (also
+                                                  //   deferred) raced the isolate and won
+  errors: text('errors'),                         // comma-joined `stage:reason`, null when clean
+}, (t) => [
+  // Serves both the prune (WHERE ts < cutoff) and every question this table
+  // exists to answer, all of which are ranges over ts. Monotonic, so inserts
+  // append to the index edge.
+  index('feed_logs_ts_idx').on(t.ts),
+]);

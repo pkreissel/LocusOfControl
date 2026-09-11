@@ -2,6 +2,14 @@
 // to it and automatically invalidated (via cache miss) when the model changes.
 export const EMBEDDING_MODEL = 'jina-embeddings-v5-text-small';
 
+// Deadline on one embedding request. Same reasoning as the GE deadlines in
+// index.ts: a hung call is worse than a failed one, because a failed chunk is
+// already a handled outcome (its candidates drop out and `failedChunks` counts
+// them) while a hang stalls the whole request until the platform kills it,
+// logging nothing. Generous against measured latency -- a 150-text batch embeds
+// in ~0.7-3.9s -- since this is a stall guard, not a latency target.
+const JINA_TIMEOUT_MS = 15000;
+
 export async function getEmbeddings(texts: string[], apiKey: string): Promise<{ embeddings: number[][]; tokens: number }> {
   const response = await fetch('https://api.jina.ai/v1/embeddings', {
     method: 'POST',
@@ -13,7 +21,8 @@ export async function getEmbeddings(texts: string[], apiKey: string): Promise<{ 
       model: EMBEDDING_MODEL,
       task: 'classification',
       input: texts.map(t => t.slice(0, 2000))
-    })
+    }),
+    signal: AbortSignal.timeout(JINA_TIMEOUT_MS)
   });
   if (!response.ok) {
     const text = await response.text();

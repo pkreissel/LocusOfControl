@@ -3,7 +3,7 @@ import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
 import { decodeEmbedding } from './minilm';
 import { fuseByRank } from './fuse';
 import { resolveFeed, ALL_SCORERS, type FeedConfig } from './feeds';
-import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions } from './db';
+import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions, recordFeedLog, pruneOldFeedLogs, type FeedLogRow } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 import { siteResponse } from './site';
 
@@ -134,6 +134,116 @@ const SKELETON_TTL_SEC = 60;
 // re-serving a body that was produced by an earlier public fallback.
 function logFeed(fields: Record<string, unknown>) {
   try { console.log('[feed] ' + JSON.stringify(fields)); } catch { /* never break the response */ }
+  // The same line, kept where it can be queried. console output is not
+  // aggregatable and does not survive, and every question worth asking of these
+  // numbers is an aggregate one over time ("what does the 99th percentile look
+  // like", "how often does GE come back empty", "was that bad minute Jina or the
+  // ranker"). Deferred past the response, so the reader pays nothing for it, and
+  // best-effort inside recordFeedLog, so diagnostics can never fail a feed.
+  try {
+    runAfterResponse(recordFeedLog(toFeedLogRow(fields)));
+    if (Math.random() < FEED_LOG_PRUNE_PROBABILITY) {
+      runAfterResponse(
+        pruneOldFeedLogs(Date.now() - FEED_LOG_RETENTION_MS)
+          .catch((e: any) => console.error("[feed log] prune failed:", errChain(e)))
+      );
+    }
+  } catch (e: any) {
+    console.error("[feed log] dispatch failed:", errChain(e));
+  }
+}
+
+// How long request diagnostics are kept, and how often a request opportunistically
+// prunes past it — same pattern as the other tables, no cron. 30 days is chosen to
+// be long enough to compare a bad day against the week before it.
+const FEED_LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const FEED_LOG_PRUNE_PROBABILITY = 0.02;
+
+// Map one `[feed]` line onto a feed_logs row.
+//
+// The paths log different shapes (a cache hit knows nothing about candidates; a
+// continuation page knows nothing about embedding), so every column but ts/feed is
+// nullable and missing keys stay null rather than defaulting to 0 — "this path had
+// no embed stage" and "the embed stage took 0ms" must not look alike in a mean.
+// Hit-path values come back off cached HTTP headers as strings, hence the coercion.
+function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
+  const num = (k: string): number | null => {
+    const v = f[k];
+    if (v === undefined || v === null || v === '') return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  const str = (k: string): string | null => {
+    const v = f[k];
+    return v === undefined || v === null ? null : String(v);
+  };
+  return {
+    id: crypto.randomUUID(),
+    ts: Date.now(),
+    feed: str('feed') ?? 'unknown',
+    did: str('did'),
+    cache: str('cache'),
+    page: str('page'),
+    personalized: str('personalized'),
+    path: str('path'),
+    ms: num('ms'),
+    gatherMs: num('gatherMs'),
+    tSeen: num('tSeen'),
+    tPrune: num('tPrune'),
+    tCand: num('tCand'),
+    tEmbed: num('tEmbed'),
+    tRank: num('tRank'),
+    tStore: num('tStore'),
+    candRaw: num('candRaw'),
+    candShort: num('candShort'),
+    cand: num('cand'),
+    pass: num('pass'),
+    off: num('off'),
+    pageLimit: num('limit'),
+    feedLen: num('feedLen'),
+    nextCursor: str('nextCursor'),
+    cacheHit: num('cacheHit'),
+    cacheMiss: num('cacheMiss'),
+    jinaChunks: num('jinaChunks'),
+    jinaFailed: num('jinaFailed'),
+    preHydrated: num('preHydrated'),
+    preKept: num('preKept'),
+    preFloor: num('preFloor'),
+    preFellBack: str('preFellBack'),
+    waitUntil: str('waitUntil'),
+    errors: str('errors'),
+  };
+}
+
+// Deadlines on the two upstream calls a feed request cannot proceed without.
+//
+// Without one, a hung dependency does not fail — it just stops, and the request
+// stalls until the platform kills the isolate. Nothing is written in that case:
+// not the [feed] line, not the feed_logs row, because both are written at the end
+// of a request that never reaches its end. So the failure this table most needs to
+// count would be precisely the one it cannot see.
+//
+// A deadline converts that silence into a path the code already handles: a
+// generate that gives up leaves an empty candidate pool (empty feed, already the
+// behaviour when GE errors), and a rank that gives up leaves the vector's own
+// order (already the behaviour when the rerank fails). Both finish the request,
+// and therefore both land in feed_logs with `errors` set.
+//
+// Sized off measured latency with headroom, not guessed: generate runs 1.7-3.0s
+// at num_candidates 1000 and rank ~0.5s. These are the point past which waiting
+// longer serves the reader worse than serving what we already have.
+const GE_GENERATE_TIMEOUT_MS = 8000;
+const GE_RANK_TIMEOUT_MS = 6000;
+
+// Render one upstream failure for the `errors` column. AbortSignal.timeout rejects
+// with a TimeoutError, which is the whole point of the column, so name it as such
+// rather than letting it read as a generic fetch failure.
+function stageErr(stage: string, e: any): string {
+  const name = e?.name;
+  const reason = (name === 'TimeoutError' || name === 'AbortError')
+    ? 'timeout'
+    : (e?.message || String(e));
+  return `${stage}:${String(reason).replace(/[,\s]+/g, ' ').slice(0, 120)}`;
 }
 function shortDid(did: string | null): string {
   return !did ? 'anon' : (did.length > 20 ? did.slice(0, 20) + '…' : did);
@@ -568,6 +678,9 @@ async function handleRequest(request: Request): Promise<Response> {
       const tC_start = Date.now();
       let candRaw = 0, candShort = 0;
       let preHydrated = 0, preKept = 0, preFloor = 0, preFellBack = false;
+      // Stage failures seen on this request, joined into the feed_logs `errors`
+      // column. Empty is the normal case and stays null in the row.
+      const errs: string[] = [];
       try {
         const buildBody = (gens: { name: string; weight: number }[]) => {
           const b: any = {
@@ -611,11 +724,13 @@ async function handleRequest(request: Request): Promise<Response> {
           try {
             const r = await fetch('https://api.greenearth.social/candidates/generate', {
               method: 'POST', headers: geHeaders, body: JSON.stringify(body),
+              signal: AbortSignal.timeout(GE_GENERATE_TIMEOUT_MS),
             });
             if (!r.ok) throw new Error(`GE Generate failed: ${r.status}`);
             return (await r.json()).candidates || [];
           } catch (e: any) {
             console.error("[getFeedSkeleton] GE generate call failed:", e?.message || String(e));
+            errs.push(stageErr('ge-generate', e));
             return [];
           }
         }));
@@ -643,7 +758,12 @@ async function handleRequest(request: Request): Promise<Response> {
         });
       } catch (err: any) {
         console.error("[getFeedSkeleton] GE generate fetch failed:", err?.message || String(err));
+        errs.push(stageErr('ge-gather', err));
       }
+      // An empty pool is not an error any call reported -- every batch can return
+      // 200 with nothing in it -- but it is the one outcome that guarantees an
+      // empty feed, so name it rather than leaving it to be inferred from cand=0.
+      if (candRaw === 0 && !errs.length) errs.push('ge-generate:empty');
       tCand = Date.now() - tC_start;
       
       const gatherMs = Date.now() - tG;
@@ -769,8 +889,10 @@ async function handleRequest(request: Request): Promise<Response> {
                   { name: 'candidate_score', weight: RANK_SIM_WEIGHT },
                 ],
                 user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
-              })
+              }),
+              signal: AbortSignal.timeout(GE_RANK_TIMEOUT_MS),
             });
+            if (!rankRes.ok) errs.push(`ge-rank:http-${rankRes.status}`);
             if (rankRes.ok) {
                 const rankData = await rankRes.json();
                 if (rankData.rankings && rankData.rankings.length > 0) {
@@ -784,6 +906,7 @@ async function handleRequest(request: Request): Promise<Response> {
             }
           } catch (e: any) {
               console.error("[getFeedSkeleton] GE rank failed:", e?.message || String(e));
+              errs.push(stageErr('ge-rank', e));
           }
 
           // NOTE: the GE /diversify step was removed. It re-sorts candidates by
@@ -864,7 +987,8 @@ async function handleRequest(request: Request): Promise<Response> {
         cacheHit: embedHits, cacheMiss: embedMisses,
         jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
         preHydrated, preKept, preFloor: preFloor.toFixed(4), preFellBack: preFellBack ? 'y' : 'n',
-        waitUntil: hasWaitUntil() ? 'y' : 'n'
+        waitUntil: hasWaitUntil() ? 'y' : 'n',
+        errors: errs.length ? errs.join(',') : null
       });
 
       return new Response(JSON.stringify(body), {
@@ -901,6 +1025,16 @@ async function handleRequest(request: Request): Promise<Response> {
       });
     } catch (e: any) {
       console.error("[getFeedSkeleton] error:", e?.status ?? '', e?.message, e?.stack);
+      // A 500 is a feed the reader did not get, which is exactly what this table
+      // exists to count -- and the only path that produced no row at all. Logged
+      // with what is still in scope out here (the try's locals are not), so a bad
+      // minute reads as rows with `errors` set instead of as a hole in the data.
+      logFeed({
+        feed: (url.searchParams.get('feed') || '').split('/').pop() || 'unknown',
+        cache: 'miss', page: 'error', ms: Date.now() - t0,
+        waitUntil: hasWaitUntil() ? 'y' : 'n',
+        errors: stageErr('request', e),
+      });
       return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
   }

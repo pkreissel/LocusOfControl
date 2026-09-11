@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
-import { embeddingUsage, feedInteractions, feedSessions, postScores } from './schema';
+import { embeddingUsage, feedInteractions, feedLogs, feedSessions, postScores } from './schema';
 import { sql, and, eq, lt, gte, inArray, desc, isNotNull } from 'drizzle-orm';
 
 declare const process: any;
@@ -463,4 +463,36 @@ export async function pruneOldSeenInteractions(retentionDays: number): Promise<v
     .limit(1000);
 
   await db.delete(feedInteractions).where(inArray(feedInteractions.id, toDelete));
+}
+
+
+//
+// Request diagnostics. One row per getFeedSkeleton request; see the feedLogs
+// comment in schema.ts for what the columns are for and what their absence means.
+
+/** The shape index.ts assembles from a `[feed]` line. Every field optional but ts/feed. */
+export type FeedLogRow = typeof feedLogs.$inferInsert;
+
+// Best-effort by construction: this is diagnostics, and diagnostics must never be
+// the reason a feed request fails. The caller defers it past the response, so the
+// only thing a failure here can cost is one missing row — which is why the schema
+// comment insists the absences be read as "no data", never as "nothing happened".
+export async function recordFeedLog(row: FeedLogRow): Promise<void> {
+  try {
+    const db = getDbClient();
+    await db.insert(feedLogs).values(row);
+  } catch (e: any) {
+    console.error("[feed log] write failed:", e?.cause?.message || e?.message);
+  }
+}
+
+// Bounded like the other opportunistic prunes: delete in capped batches so one
+// unlucky request never pays for a huge backlog in a single statement.
+export async function pruneOldFeedLogs(cutoffTs: number): Promise<void> {
+  const db = getDbClient();
+  const toDelete = db.select({ id: feedLogs.id })
+    .from(feedLogs)
+    .where(lt(feedLogs.ts, cutoffTs))
+    .limit(1000);
+  await db.delete(feedLogs).where(inArray(feedLogs.id, toDelete));
 }
