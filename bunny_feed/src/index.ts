@@ -2,7 +2,7 @@ import { jwtDecode } from 'jwt-decode';
 import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
 import { decodeEmbedding } from './minilm';
 import { fuseByRank } from './fuse';
-import { resolveFeed, ALL_SCORERS, type FeedConfig } from './feeds';
+import { resolveFeed, ALL_SCORERS, bypassBudget, type FeedConfig } from './feeds';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions, recordFeedLog, pruneOldFeedLogs, type FeedLogRow } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 import { siteResponse } from './site';
@@ -210,6 +210,8 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
     preKept: num('preKept'),
     preFloor: num('preFloor'),
     preFellBack: str('preFellBack'),
+    preBypass: num('preBypass'),
+    preBypassDropped: num('preBypassDropped'),
     waitUntil: str('waitUntil'),
     errors: str('errors'),
   };
@@ -678,6 +680,7 @@ async function handleRequest(request: Request): Promise<Response> {
       const tC_start = Date.now();
       let candRaw = 0, candShort = 0;
       let preHydrated = 0, preKept = 0, preFloor = 0, preFellBack = false;
+      let preBypass = 0, preBypassDropped = 0;
       // Stage failures seen on this request, joined into the feed_logs `errors`
       // column. Empty is the normal case and stays null in the row.
       const errs: string[] = [];
@@ -787,6 +790,9 @@ async function handleRequest(request: Request): Promise<Response> {
         // LOC.prefilter in feeds.ts for the measurements.
         let paidPool = candidates;
         let miniScores: (number | null)[] | null = null;
+        // Per paid-pool candidate: did it get here by bypassing the free stage?
+        // Those are the ones `threshold` still applies to below.
+        let bypassed: boolean[] | null = null;
         const pf = feedConfig.prefilter;
         if (pf) {
           const mini = candidates.map(c => {
@@ -801,17 +807,53 @@ async function handleRequest(request: Request): Promise<Response> {
           // empty the feed. Below the floor we fall back to the original
           // single-stage path: more expensive, and correct.
           if (preHydrated >= candidates.length * MIN_HYDRATION_COVERAGE) {
-            const kept = candidates
-              .map((c, i) => ({ c, p: mini[i] }))
-              .filter(x => x.p !== null)
+            // Candidates the free scorer cannot read (today: German — see
+            // pf.bypass) are pulled out BEFORE the ranking, not ranked and then
+            // rescued. Ranking them first would be the bug: their scores are the
+            // near-chance numbers this whole detour exists because of, so they
+            // would take shortlist places off English posts whose scores mean
+            // something, and lose the German posts that scored badly anyway.
+            //
+            // Both halves of the config or neither: a `bypass` with no budget to
+            // spend would route German candidates out of the free stage and then
+            // drop every one of them for want of a place, which is worse than the
+            // bad ranking this replaces. Missing limit = no detour, today's path.
+            const bypassMax = pf.bypass ? (pf.bypassLimit ?? 0) : 0;
+            const bypassFn = bypassMax > 0 ? pf.bypass : undefined;
+            const routed = candidates.map((c, i) => ({
+              c, p: mini[i], bypass: bypassFn ? bypassFn(c.text) : false,
+            }));
+            const kept = routed
+              .filter(x => !x.bypass && x.p !== null)
               .sort((a, b) => (b.p as number) - (a.p as number))
               .slice(0, pf.shortlist);
-            paidPool = kept.map(x => x.c);
-            miniScores = kept.map(x => x.p);
+            // Ordered by the same free score the group was routed around — which
+            // is not the contradiction it looks like. What the measurement kills
+            // is comparing a German score against an English one: on a shared
+            // scale German is depressed, so a global cut keeps 15% of German
+            // against 21% of English. WITHIN the group that bias is common to
+            // every candidate and cancels, and what is left still ranks above
+            // chance (AUC 0.618 on the routed group, against the 0.500 an
+            // arbitrary order earns). Measured on the corpus at a binding cap,
+            // ordering the detour this way rather than by GE's pool order lifts
+            // recall of routed band-positives from 27% to 47% at identical cost.
+            // Unhydrated candidates have no score at all and sort last.
+            const detour = routed.filter(x => x.bypass)
+              .sort((a, b) => (b.p ?? -Infinity) - (a.p ?? -Infinity));
+            // Share-matched against the rest of the pool; see bypassBudget().
+            const taken = detour.slice(0, bypassBudget(
+              pf.shortlist, detour.length, routed.length - detour.length,
+              pf.bypassFloor ?? bypassMax, bypassMax));
+            preBypass = taken.length;
+            preBypassDropped = detour.length - taken.length;
+            paidPool = [...kept.map(x => x.c), ...taken.map(x => x.c)];
+            miniScores = [...kept.map(x => x.p), ...taken.map(() => null)];
+            bypassed = [...kept.map(() => false), ...taken.map(() => true)];
             preKept = paidPool.length;
             // Where the cut actually landed on this pool. With no fixed floor this
             // is the only way to see the stage's operating point, and it is what a
-            // future recalibration of the paid gate has to be read against.
+            // future recalibration of the paid gate has to be read against. The
+            // bypassed tail has no score of its own and is not part of it.
             preFloor = kept.length ? (kept[kept.length - 1].p as number) : 0;
           } else {
             preFellBack = true;
@@ -842,6 +884,13 @@ async function handleRequest(request: Request): Promise<Response> {
             // the disagreements this feed is paying Jina to hear. A null score is
             // a failed Jina chunk rather than a rejection, so the candidate stays
             // and is ranked on its free score alone.
+            //
+            // A bypassed candidate is the exception on both counts. Nothing has
+            // judged it yet, so the Jina gate is its only one and does apply — and
+            // if its Jina chunk failed it has no usable score at all (its free
+            // score is the near-chance number it was routed around), so it drops
+            // rather than riding into the feed on a meaningless rank.
+            if (bypassed?.[i] && (p === null || p < feedConfig.threshold)) continue;
             paidPool[i].minilmScore = miniScores[i];
             paidPool[i].jinaScore = p;
             // Overwrite the generator's popularity `score` (unused after ranking)
@@ -987,6 +1036,7 @@ async function handleRequest(request: Request): Promise<Response> {
         cacheHit: embedHits, cacheMiss: embedMisses,
         jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
         preHydrated, preKept, preFloor: preFloor.toFixed(4), preFellBack: preFellBack ? 'y' : 'n',
+        preBypass, preBypassDropped,
         waitUntil: hasWaitUntil() ? 'y' : 'n',
         errors: errs.length ? errs.join(',') : null
       });
@@ -1017,7 +1067,10 @@ async function handleRequest(request: Request): Promise<Response> {
           // place scored (p=, the cut's real operating point now that the stage
           // ranks rather than thresholds), and whether coverage was too low to
           // prefilter at all (fb=y means this request paid the old full price).
-          'X-Prefilter': `hyd=${preHydrated} kept=${preKept} p=${preFloor.toFixed(4)} fb=${preFellBack ? 'y' : 'n'}`,
+          // de= is the language detour: how many candidates skipped the free stage
+          // because it cannot read them, and how many more were over bypassLimit
+          // (a nonzero second number means the cap is binding on this pool).
+          'X-Prefilter': `hyd=${preHydrated} kept=${preKept} p=${preFloor.toFixed(4)} fb=${preFellBack ? 'y' : 'n'} de=${preBypass}/${preBypass + preBypassDropped}`,
           // Whether deferred (post-response) work is actually supported here; if
           // this reads 'n', prunes and token accounting are silently no-ops.
           'X-Wait-Until': hasWaitUntil() ? 'y' : 'n',

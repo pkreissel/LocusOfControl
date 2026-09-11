@@ -1,4 +1,5 @@
 import { createScorer, type Scorer, type VectorData } from './vector';
+import { looksGerman } from './lang';
 import locVectorData from './vector.json';
 import locMinilmVectorData from './vector_minilm.json';
 
@@ -113,6 +114,57 @@ export type FeedConfig = {
      * floor could not do this job.
      */
     shortlist: number;
+    /**
+     * Candidates this predicate accepts skip the free stage entirely and go
+     * straight to the paid one, because the free scorer cannot read them.
+     *
+     * `all-MiniLM-L12-v2` is an English-only model. Out-of-fold over the labelled
+     * corpus the MiniLM probe beats Jina by +0.089 AUC on English and trails it by
+     * 0.085 on German — an interaction of +0.174, CI [+0.057, +0.292] — and a
+     * global 20% cut keeps only 29% of German internal posts against 45% of
+     * English. Training on German rows does not fix it (0.588 in-language, against
+     * Jina's 0.666 trained on English alone): the axis is not linearly present in
+     * that space for German text. So German candidates are routed around the free
+     * stage rather than ranked badly by it. See REPORT_minilm_vs_jina_by_lang.md
+     * and src/lang.ts.
+     *
+     * Bypassed candidates carry no free score, so unlike the shortlist they ARE
+     * held to `threshold` on their Jina score — that gate is the only vote they
+     * get. Unset = every candidate goes through the free stage, today's behaviour.
+     */
+    bypass?: (text: string) => boolean;
+    /**
+     * Ceiling on how many bypassed candidates reach the paid stage, since they are
+     * not competing for the `shortlist` places and would otherwise be unbounded.
+     *
+     * The budget actually spent is share-matched, not this number: bypassed
+     * candidates get the same fraction of their own group that the shortlist takes
+     * of the rest of the pool, floored at `bypassFloor` and capped here. A fixed
+     * number cannot be right at both ends of the range this pool spans — 50 is
+     * every German post on a 1.4%-German pool and 14% of them on a half-German
+     * one, which would quietly reintroduce the under-service this whole detour
+     * exists to remove, just at a different pool composition.
+     *
+     * They are taken in free-score order within the group. The score is unusable
+     * for deciding German-vs-English — that is the whole reason for the detour —
+     * but the bias it carries is common to every candidate in the group, so it
+     * cancels, and the residual ranking still beats an arbitrary one (AUC 0.618
+     * against 0.500). On a pool where this cap binds, that choice is worth 27% ->
+     * 47% of the routed band-positives for the same money.
+     *
+     * Required whenever `bypass` is set, and enforced rather than assumed: a
+     * bypass with no budget would route candidates out of the free stage and then
+     * drop all of them, so index.ts treats a missing or zero limit as "no bypass"
+     * and leaves those candidates in the ordinary shortlist.
+     */
+    bypassLimit?: number;
+    /**
+     * Minimum bypass budget, whatever the share arithmetic says. Cheap insurance
+     * at the low end: on a pool with a handful of German posts the proportional
+     * budget rounds to 2, and paying Jina for all of them instead costs a rounding
+     * error. Defaults to `bypassLimit` when unset, i.e. today's fixed behaviour.
+     */
+    bypassFloor?: number;
   };
   /**
    * Order the shortlist by the mean of its two normalised ranks (MiniLM and Jina)
@@ -123,6 +175,29 @@ export type FeedConfig = {
    */
   fuse?: boolean;
 };
+
+/**
+ * How many bypassed candidates the paid stage can afford this request.
+ *
+ * Share-matched: the detour buys the same fraction of its own group that the
+ * shortlist buys of the rest, so being on one side of the language split is not
+ * itself a disadvantage. Floored so a handful of candidates are simply all bought
+ * (the proportional budget rounds to 2 on a 1.4%-German pool, and buying all ten
+ * costs a rounding error), and ceilinged so the paid stage at worst doubles
+ * instead of growing with the pool.
+ *
+ * Lives here rather than inline in index.ts because it is policy, not plumbing —
+ * the numbers it balances are the ones documented on `bypassLimit` above — and
+ * because the boundaries are worth a test (see test_prefilter.ts).
+ */
+export function bypassBudget(
+  shortlist: number, nBypassed: number, nRest: number, floor: number, max: number,
+): number {
+  if (nBypassed <= 0 || max <= 0) return 0;
+  // No rest to match a share against (an all-German pool): the ceiling decides.
+  const share = nRest > 0 ? Math.round(shortlist * nBypassed / nRest) : max;
+  return Math.min(max, Math.max(floor, share), nBypassed);
+}
 
 // Locus-of-control axis: posts showing agency over posts showing helplessness.
 //
@@ -193,9 +268,40 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // that full fusion over everything would have chosen, and precision@30 was flat
   // from 15% upward -- the shortlist is not where quality is lost. It cuts the
   // paid stage from ~364 embeddings per uncached request to <=150.
+  //
+  // German candidates do not go through this stage at all (`bypass`): the free
+  // scorer is an English-only model and ranks German near chance, so putting it in
+  // charge of which German posts Jina gets to see loses ~70% of them.
+  //
+  // The budget for that detour is share-matched — German gets the same fraction of
+  // its own group that the shortlist takes of the rest — because the pools this
+  // deployment draws span two orders of magnitude of German. A generic live pool is
+  // 1.4% German (10 of 708 measured), where the floor of 50 buys every one of them
+  // for ~7% more Jina tokens. The labelled corpus, from a German-leaning network,
+  // is 22.6%. The interaction rows — one German-reading user's own likes — are 71%.
+  // A fixed 50 is all of the first pool, a third of the second and a tenth of the
+  // third, which is the same under-service this detour exists to remove, arriving
+  // by a different door.
+  //
+  // The ceiling is the shortlist itself, so the paid stage can at worst double
+  // rather than growing with the pool. Past roughly half a pool being unreadable to
+  // the free scorer, the honest move is not a bigger detour but no prefilter at all
+  // — the same single-stage path `preFellBack` already takes when hydration stops
+  // arriving. Nothing above 22.6% German is measured, because no labelled pool goes
+  // there; `preBypass`/`preBypassDropped` in feed_logs are what would say so.
+  //
+  // Recall is bounded by the ranker, not by this budget. At a binding cap the
+  // detour recovers 47% of the routed band-positives against the global cut's 31%,
+  // and Jina *itself*, ordering the same group, would only reach 55% — so the
+  // budget is 86% of the way to what the paid ranker could do with it. Raising it
+  // is the only lever that moves German recall materially (100 slots -> 72%,
+  // 160 -> 100%), and it is a straight Jina-token trade.
   prefilter: {
     scorer: createScorer(locMinilmVectorData as VectorData),
     shortlist: 150,
+    bypass: looksGerman,
+    bypassLimit: 150,
+    bypassFloor: 50,
   },
   fuse: true,
 };

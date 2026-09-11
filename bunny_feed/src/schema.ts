@@ -157,6 +157,9 @@ export const feedLogs = sqliteTable('feed_logs', {
   preKept: integer('pre_kept'),                   //   how many reached the paid stage, and
   preFloor: real('pre_floor'),                    //   where the rank cut landed
   preFellBack: text('pre_fell_back'),             // 'y' = coverage too low, paid the full price
+  preBypass: integer('pre_bypass'),               // candidates routed AROUND the free stage
+  preBypassDropped: integer('pre_bypass_dropped'),//   because it cannot read their language,
+                                                  //   and how many more the cap turned away
   waitUntil: text('wait_until'),                  // 'n' = no waitUntil here, so this row (also
                                                   //   deferred) raced the isolate and won
   errors: text('errors'),                         // comma-joined `stage:reason`, null when clean

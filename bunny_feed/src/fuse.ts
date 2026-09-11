@@ -26,9 +26,13 @@ export type Fusable = {
  * external leak 0.245 against 0.264 and 0.286), and on live posts it held MiniLM's
  * 62% internal while cutting external leak from 12% to 6%.
  *
- * A candidate whose Jina chunk failed has no paid score; it keeps its free rank on
- * both sides, so a Jina outage degrades the order to the MiniLM one rather than
- * burying every affected post.
+ * A candidate with only one usable score keeps that rank on both sides, so it is
+ * ranked on the signal it has rather than buried by the one it lacks. That covers
+ * both directions: a failed Jina chunk (a Jina outage degrades the order to the
+ * MiniLM one rather than sinking every affected post) and a candidate that skipped
+ * the free stage because the free scorer could not read its language (see
+ * prefilter.bypass in feeds.ts — those arrive with minilmScore null by
+ * construction, not by failure, and are already past the paid gate).
  *
  * Known property, not a bug: the mean of ranks is linear, so "middling in both"
  * ties exactly with "top of one, bottom of the other" (ranks 1+1 == 0+2). A
@@ -52,9 +56,10 @@ export function fuseByRank(cands: Fusable[]): void {
   const rMini = ranksBy(c => c.minilmScore);
   const rJina = ranksBy(c => c.jinaScore);
   for (let i = 0; i < n; i++) {
+    const m = cands[i].minilmScore == null ? rJina[i] : rMini[i];
     const j = cands[i].jinaScore == null ? rMini[i] : rJina[i];
     // Best rank 0 -> score 1, worst -> ~0, so `score` stays "higher is better" for
     // the sort below and for GE's candidate_score model.
-    cands[i].score = 1 - ((rMini[i] + j) / 2) / n;
+    cands[i].score = 1 - ((m + j) / 2) / n;
   }
 }
