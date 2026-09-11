@@ -14,6 +14,14 @@ import locMinilmVectorData from './vector_minilm.json';
 // each retrain moves the score distribution underneath it — that is how the LoC
 // gate once sat at 0.55 and rejected literally nothing. Every number below was
 // measured against its own vector's distribution; recalibrate on every retrain.
+//
+// Nor is one portable between candidate *pools*. A threshold set as a percentile
+// describes the pool it was measured on, and this deployment draws two: GE's
+// `popularity` mix for anonymous requests and `followed_users` for signed-in ones.
+// The same 0.9356 was the 80th percentile of the first and the 87th of the second,
+// which quietly cut the signed-in feed to a third of its length (see the note on
+// LOC.prefilter). Prefer ranking to an absolute cut wherever a stage only has to
+// choose "the best N of whatever arrived".
 
 export type FeedConfig = {
   /** Record key of the app.bsky.feed.generator record. */
@@ -94,9 +102,16 @@ export type FeedConfig = {
   prefilter?: {
     /** Scorer built from a vector trained in the MiniLM space (see embed_minilm.py). */
     scorer: Scorer;
-    /** Minimum calibrated probability, on THIS vector's distribution. Not portable. */
-    threshold: number;
-    /** How many survivors reach the paid stage. This is the whole cost control. */
+    /**
+     * How many of the top-scoring candidates reach the paid stage.
+     *
+     * This is the entire selection rule — the pool is ranked by the prefilter
+     * scorer and cut here, with no absolute floor. It is therefore also the whole
+     * cost control: the paid stage never sees more than this many posts, however
+     * big the pool grows. The quality floor is `threshold` above, applied to the
+     * Jina score after this cut. See the note on LOC.prefilter for why an absolute
+     * floor could not do this job.
+     */
     shortlist: number;
   };
   /**
@@ -131,12 +146,35 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
   // Going to 8 buys little (245 through) and starts cutting real one-liners.
   minWords: 6,
-  // Ranks every candidate for free over GE's hydrated embeddings, then hands only
-  // the top `shortlist` to Jina. 0.9356 is the 80th percentile of this vector's
-  // probability over 2143 live candidates -- i.e. "keep the top 20%" -- measured on
-  // its own distribution, which is the only way any of these thresholds mean
-  // anything. It is a floor, not the selector: `shortlist` does the real cutting,
-  // and the threshold only stops a thin pool from promoting obvious rejects.
+  // Ranks every candidate for free over GE's hydrated embeddings and hands the top
+  // `shortlist` to Jina. Rank only: there is deliberately no probability floor on
+  // this stage.
+  //
+  // There was one (0.9356, the 80th percentile of this vector's probability over
+  // 2143 live candidates), and it silently became the selector instead of the
+  // safety net it was documented as. A calibrated percentile describes the *pool*
+  // it was measured on, and this deployment draws two different pools: anonymous
+  // requests get GE's `popularity` mix under a fallback DID, signed-in requests get
+  // `followed_users`. Measured 2026-09-11, the anon pool sat at p80 = 0.9457, so
+  // 0.9356 kept 30% (113 of 375) and the feed filled its 100-post cap -- while the
+  // signed-in pool sat at p80 = 0.9223, which made the same number the ~87th
+  // percentile and kept 13%:
+  //
+  //   signed-in, 500 candidates -> 470 past minWords -> 59 past the floor
+  //     -> 41 past the Jina gate. With 1000 seen URIs excluded: 39 -> 29.
+  //
+  // So a regular reader's feed ended after ~29 posts against a cap of 100, and
+  // `shortlist` (150) never bound at all. Ranking instead: the same two pools give
+  // 100 and 96 past the Jina gate, i.e. the cap, with the shortlist's own floor
+  // landing around p = 0.90 on the MiniLM distribution.
+  //
+  // Nothing about that weakens the axis, because the floor was never what enforced
+  // it: the paid Jina gate (`threshold` above, 0.88) is, and it still rejects a
+  // third of the shortlist. Survivors' Jina probability was unchanged at p50 =
+  // 0.911 -- ranking widened what the gate got to choose from, it did not lower the
+  // bar. If a pool is ever thin enough that the top 150 are genuinely all rejects,
+  // that gate is what says so; X-Prefilter reports the shortlist's floor
+  // probability (p=) on every response so the operating point stays observable.
   //
   // 150 was chosen against MAX_RERANK_CANDIDATES (100) with room for Jina chunk
   // failures. On the labelled corpus a 20% prefilter preserved 90% of the top 30
@@ -145,7 +183,6 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // paid stage from ~364 embeddings per uncached request to <=150.
   prefilter: {
     scorer: createScorer(locMinilmVectorData as VectorData),
-    threshold: 0.9356,
     shortlist: 150,
   },
   fuse: true,

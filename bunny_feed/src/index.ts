@@ -567,7 +567,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       const tC_start = Date.now();
       let candRaw = 0, candShort = 0;
-      let preHydrated = 0, preKept = 0, preFellBack = false;
+      let preHydrated = 0, preKept = 0, preFloor = 0, preFellBack = false;
       try {
         const buildBody = (gens: { name: string; weight: number }[]) => {
           const b: any = {
@@ -653,9 +653,18 @@ async function handleRequest(request: Request): Promise<Response> {
         const tE_start = Date.now();
 
         // (3a) Free first pass. Rank the WHOLE pool on GE's hydrated embeddings and
-        // keep only a shortlist, so the billed stage below sees ~150 candidates
-        // instead of every survivor of the text gates. Costs one dot product each
-        // (~5us; 4000 candidates measured at ~20ms total), no API call, no cache.
+        // keep only the top `shortlist`, so the billed stage below sees ~150
+        // candidates instead of every survivor of the text gates. Costs one dot
+        // product each (~5us; 4000 candidates measured at ~20ms total), no API
+        // call, no cache.
+        //
+        // Rank, not threshold. This stage's only job is to pick the best N of
+        // whatever the pool happens to contain; an absolute floor here made the
+        // feed's length a property of how the pool's scores happened to be
+        // distributed that day, which is how signed-in readers ended up with ~29
+        // posts against a 100-post cap. The quality decision belongs to the paid
+        // gate below, whose threshold is applied per-feed to the Jina score. See
+        // LOC.prefilter in feeds.ts for the measurements.
         let paidPool = candidates;
         let miniScores: (number | null)[] | null = null;
         const pf = feedConfig.prefilter;
@@ -674,12 +683,16 @@ async function handleRequest(request: Request): Promise<Response> {
           if (preHydrated >= candidates.length * MIN_HYDRATION_COVERAGE) {
             const kept = candidates
               .map((c, i) => ({ c, p: mini[i] }))
-              .filter(x => x.p !== null && x.p >= pf.threshold)
+              .filter(x => x.p !== null)
               .sort((a, b) => (b.p as number) - (a.p as number))
               .slice(0, pf.shortlist);
             paidPool = kept.map(x => x.c);
             miniScores = kept.map(x => x.p);
             preKept = paidPool.length;
+            // Where the cut actually landed on this pool. With no fixed floor this
+            // is the only way to see the stage's operating point, and it is what a
+            // future recalibration of the paid gate has to be read against.
+            preFloor = kept.length ? (kept[kept.length - 1].p as number) : 0;
           } else {
             preFellBack = true;
             console.error(`[getFeedSkeleton] prefilter disabled: only ${preHydrated}/${candidates.length} candidates hydrated`);
@@ -850,7 +863,7 @@ async function handleRequest(request: Request): Promise<Response> {
         tSeen, tPrune, tCand, tEmbed, tRank, tStore,
         cacheHit: embedHits, cacheMiss: embedMisses,
         jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
-        preHydrated, preKept, preFellBack: preFellBack ? 'y' : 'n',
+        preHydrated, preKept, preFloor: preFloor.toFixed(4), preFellBack: preFellBack ? 'y' : 'n',
         waitUntil: hasWaitUntil() ? 'y' : 'n'
       });
 
@@ -876,9 +889,11 @@ async function handleRequest(request: Request): Promise<Response> {
           // feed shows m=0 (or only genuinely new posts) on a repeat request.
           'X-Score-Cache': `h=${embedHits} m=${embedMisses} jina=${embedChunks}${embedFailedChunks ? ` fail=${embedFailedChunks}` : ''}`,
           // Prefilter diagnostics: how many candidates arrived hydrated, how many
-          // survived into the paid stage, and whether coverage was too low to
+          // survived into the paid stage, the probability the shortlist's last
+          // place scored (p=, the cut's real operating point now that the stage
+          // ranks rather than thresholds), and whether coverage was too low to
           // prefilter at all (fb=y means this request paid the old full price).
-          'X-Prefilter': `hyd=${preHydrated} kept=${preKept} fb=${preFellBack ? 'y' : 'n'}`,
+          'X-Prefilter': `hyd=${preHydrated} kept=${preKept} p=${preFloor.toFixed(4)} fb=${preFellBack ? 'y' : 'n'}`,
           // Whether deferred (post-response) work is actually supported here; if
           // this reads 'n', prunes and token accounting are silently no-ops.
           'X-Wait-Until': hasWaitUntil() ? 'y' : 'n',
