@@ -47,3 +47,6 @@ reposts_analysis.json
 
 # Local backup copies of regenerable datasets
 *.bak
+
+# Language flags for the offline evaluation (regenerate: bunny_feed/dump_lang_flags.ts)
+lang_flags_*.json
