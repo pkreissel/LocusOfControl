@@ -146,6 +146,18 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
   // Going to 8 buys little (245 through) and starts cutting real one-liners.
   minWords: 6,
+  // GE's per-request ceiling. Asked for here not to make the feed longer -- the
+  // rank-based prefilter already fills the 100-post cap out of 500 -- but to
+  // improve what the top 150 are chosen from. Doubling the pool roughly doubles
+  // the field the shortlist ranks (500 -> 474 past minWords, 1000 -> 935) and
+  // lifts where the cut lands from p = 0.9016 to p = 0.9244 on the signed-in pool,
+  // 0.8997 -> 0.9270 on the anonymous one: a better 150, not more of them.
+  //
+  // Costs +0.5-1.4s on the GE call (1.2-1.6s -> 1.7-3.0s measured over three calls
+  // each) and doubles the hydrated payload to ~2.6MB. The paid stage does not grow
+  // -- it is capped at `shortlist` either way -- though a shortlist drawn from
+  // twice the pool churns more, so more distinct posts reach Jina over time.
+  numCandidates: 1000,
   // Ranks every candidate for free over GE's hydrated embeddings and hands the top
   // `shortlist` to Jina. Rank only: there is deliberately no probability floor on
   // this stage.
