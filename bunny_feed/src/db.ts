@@ -264,13 +264,29 @@ export async function putScores(entries: { uri: string; score: number; version: 
 
 // Delete cached scores older than `cutoffTs` (unix ms). Called opportunistically
 // to keep the table bounded.
+//
+// Deliberately a single unbounded cutoff delete rather than the batched
+// `uri IN (SELECT ... LIMIT n)` shape the other two prunes use, for two reasons
+// measured against live on 2026-09-11:
+//
+// 1. A 1000-row cap could not keep up. The prune only dispatches on a *fresh*
+//    page-1 generation (the `cont` and `reuse` paths return before this code),
+//    which runs ~34x/day; at SCORE_PRUNE_PROBABILITY that is ~0.7 runs/day, so
+//    the cap allowed ~680 deletions/day against ~3200 new rows/day. The table
+//    grew without bound and rows outlived SCORE_CACHE_MAX_AGE_MS by days (the
+//    oldest live row was 5 days old under a 4-day TTL). Deleting on the cutoff
+//    makes one dispatch clear the whole backlog regardless of how rarely it
+//    fires, which is what decouples correctness from traffic volume.
+// 2. The batched form was keyed on `uri` alone while the primary key is
+//    (uri, version), so pruning one scoring vector's stale row also dropped
+//    another vector's *fresh* row for the same post — silently re-billing Jina
+//    for a warm score. With no subquery there is no uri-only match to get wrong.
+//
+// Cost is bounded by arrival rate (a few thousand rows) and served by
+// post_scores_created_at_idx, so it stays a cheap indexed range delete.
 export async function pruneOldScores(cutoffTs: number): Promise<void> {
   const db = getDbClient();
-  const toDelete = db.select({ uri: postScores.uri })
-    .from(postScores)
-    .where(lt(postScores.createdAt, cutoffTs))
-    .limit(1000);
-  await db.delete(postScores).where(inArray(postScores.uri, toDelete));
+  await db.delete(postScores).where(lt(postScores.createdAt, cutoffTs));
 }
 
 //
