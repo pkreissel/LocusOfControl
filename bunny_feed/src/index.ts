@@ -27,8 +27,33 @@ function errChain(e: any): string {
 // nothing after a retrain moved the distribution out from under it. See the
 // calibration notes on each FeedConfig.
 
-// Maximum number of candidates to send to the final GE reranker (rank/predict)
-const MAX_RERANK_CANDIDATES = 100;
+// Maximum number of candidates to send to the final GE reranker (rank/predict).
+//
+// This is also the entire length of the feed, which is easy to miss from the
+// name: the list this truncates becomes `rankedUris`, which is frozen into the
+// feed_sessions row that every cursor page slices from. So a reader scrolls
+// exactly this many posts and then gets no cursor, i.e. end-of-feed.
+//
+// At 100 that cap was throwing away work already paid for. The rank-based
+// prefilter hands the paid stage ~150 shortlisted candidates plus the bypassed
+// German ones (measured live: preKept 162 anonymous, 250-300 signed-in), and
+// non-bypassed candidates deliberately skip the `threshold` gate, so 200-250
+// survive to be sorted here and 100-150 of them were dropped on the floor.
+//
+// 150 measured against GE's ranker on a live 1000-candidate pool, best of two
+// calls each, payload including the hydrated embeddings each candidate carries:
+//
+//   n=100  286KB  0.90s      n=200  572KB  1.06s
+//   n=150  424KB  0.77s      n=250  716KB  1.19s
+//
+// Flat well past 150 — the extra 138KB costs nothing measurable — so the ceiling
+// here is the shortlist, not the reranker. What the rank stage actually gets is
+// whatever `budget.slice(GE_RANK_TIMEOUT_MS)` leaves it, and a second of upload
+// is not what decides that; if the budget is gone the stage is skipped and these
+// 150 are served in the vector's own order. Note GE returns slightly fewer
+// rankings than it is given (146 of 150, 99 of 100); the sort below leaves those
+// in place at the end rather than dropping them, so the feed is still this long.
+const MAX_RERANK_CANDIDATES = 150;
 
 // Minimum share of candidates that must carry a hydrated embedding before the free
 // prefilter is trusted with the pool. Measured coverage after the text gates was

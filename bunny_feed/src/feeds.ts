@@ -280,8 +280,13 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // that gate is what says so; X-Prefilter reports the shortlist's floor
   // probability (p=) on every response so the operating point stays observable.
   //
-  // 150 was chosen against MAX_RERANK_CANDIDATES (100) with room for Jina chunk
-  // failures. On the labelled corpus a 20% prefilter preserved 90% of the top 30
+  // 150 was chosen against MAX_RERANK_CANDIDATES when that cap was 100, with room
+  // for Jina chunk failures. The cap is now 150 as well, so this stage no longer
+  // over-provisions against it: the English side alone fills the feed only if
+  // nothing fails, and the bypassed German candidates supply the rest of the
+  // margin. Raising the cap further means raising this number first, and that one
+  // does cost Jina tokens — this is the only number here that bounds the bill.
+  // On the labelled corpus a 20% prefilter preserved 90% of the top 30
   // that full fusion over everything would have chosen, and precision@30 was flat
   // from 15% upward -- the shortlist is not where quality is lost. It cuts the
   // paid stage from ~364 embeddings per uncached request to <=150.
