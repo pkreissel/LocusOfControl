@@ -48,7 +48,11 @@ echo "=== [5/7] MiniLM embedding caches ==="
 [ -f data/embeddings_lmstudio_soft_minilm.npz ] || LOC_TEACHER_FILE=$TEACHER $PY embed_minilm.py
 
 echo "=== [6/7] Train both vectors ==="
-LOC_TEACHER_FILE=$TEACHER $PY train_internal_vector.py
+# The two vectors are selected on DIFFERENT metrics because they do different
+# jobs. Jina is the quality gate, judged on the head of the ranking. MiniLM is a
+# prefilter whose only job is to not lose candidates before the paid stage,
+# judged on recall into the shortlist at the production cut (see PREFILTER_CUT).
+LOC_TEACHER_FILE=$TEACHER LOC_SELECT_METRIC=val_precision@50 $PY train_internal_vector.py
 
 LOC_TEACHER_FILE=$TEACHER \
 LOC_EMB_CACHE=data/embeddings_lmstudio_soft_minilm.npz \
@@ -57,6 +61,7 @@ LOC_VAL_EMB_CACHE=data/embeddings_gemini_minilm_v2.npz \
 LOC_VECTOR_OUT=data/internal_vector_minilm.npy \
 LOC_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L12-v2 \
 LOC_EMBEDDING_TASK=none \
+LOC_SELECT_METRIC=val_recall@cut \
   $PY train_internal_vector.py
 
 echo "=== [7/7] Export for the edge ==="

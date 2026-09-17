@@ -146,6 +146,14 @@ TARGET_MODE = os.environ.get("LOC_TARGET_MODE", "band")
 NEU_BAND = float(os.environ.get("LOC_NEU_BAND", "2.0"))
 # Model-selection metric (a key in evaluate()'s dict). Default to the graded
 # ranking objective; set LOC_SELECT_METRIC=val_auc_internal for the old behavior.
+#
+# The two deployed vectors want DIFFERENT metrics, because they do different
+# jobs. The Jina vector is the quality gate and is judged on the head of the
+# ranking (val_precision@50). The MiniLM vector is a prefilter whose only job is
+# to not lose candidates before the paid stage, and is judged on recall into the
+# shortlist (val_recall@cut, measured at the production cut). Selecting both on one metric is how a retrain can
+# improve the feed's top and quietly shrink what reaches it -- see
+# recall_at_frac() and docs/reports/REPORT_typesafe_distill_ab.md.
 SELECT_METRIC = os.environ.get("LOC_SELECT_METRIC", "val_ndcg_graded")
 # Back-compat: LOC_USE_LOC_SCORE=0 forces the legacy target.
 if os.environ.get("LOC_USE_LOC_SCORE", "1") == "0":
@@ -288,9 +296,49 @@ def rocchio_vector(X, y_target, sample_weight=None):
     return v / (np.linalg.norm(v) + 1e-9)
 
 
+# Share of the non-German candidate pool the MiniLM prefilter forwards to the
+# paid stage: `shortlist` (150) over the pool that reaches it (~743 after
+# minWords and the German bypass). This is the n at which recall actually
+# matters, so it is the n the prefilter is selected on.
+PREFILTER_CUT = float(os.environ.get("LOC_PREFILTER_CUT", "0.202"))
+
+
 def precision_at_k(scores, is_relevant, k):
     top = np.argsort(-scores)[:k]
     return float(is_relevant[top].mean())
+
+
+def recall_at_frac(scores, is_relevant, frac):
+    """Share of the positives that survive into the top `frac` of the ranking.
+
+    This is the prefilter's objective, and it is not the same as precision at
+    the head. The MiniLM stage exists only to hand a shortlist to the paid Jina
+    stage, so anything it drops is lost for good -- no later stage can recover
+    it -- while its ordering *within* the shortlist is rescored anyway. A vector
+    selected on nDCG or precision@k optimises the head and can be materially
+    worse through the body, which is exactly the wrong trade here: measured on
+    this axis, swapping teacher labels lifted precision@25 from 0.56 to 0.68 and
+    simultaneously cut recall of gate-passing posts at the live shortlist rate
+    from 38% to 35%.
+
+    `frac`, not an absolute k, because the cut is a share of the candidate pool,
+    and the validation set is not the size of a production pool. Measure it, do
+    not assume it: over five production requests (2026-09-17) the prefilter saw
+    hyd=754-755 hydrated candidates, of which 11-12 were German and bypassed the
+    stage entirely, so `shortlist` = 150 of ~743 non-German candidates =
+    PREFILTER_CUT below. Re-derive it whenever `shortlist`, `numCandidates` or
+    `minWords` changes in feeds.ts -- the X-Prefilter response header reports
+    hyd/kept/de on every request, which is where these numbers came from.
+
+    Positives here are the validation label. The truest target is "posts the
+    paid stage would keep", which needs that stage's vector and threshold and so
+    cannot be computed inside a single-space training run -- measure it against
+    a trained pair before deploying a prefilter, as the report does.
+    """
+    k = max(1, int(round(len(scores) * frac)))
+    top = np.argsort(-scores)[:k]
+    total = is_relevant.sum()
+    return float(is_relevant[top].sum() / total) if total else 0.0
 
 
 def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
@@ -317,6 +365,11 @@ def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
         m["val_avg_precision"] = float(average_precision_score(val_internal, s_val))
     for k in (10, 25, 50):
         m[f"val_precision@{k}"] = precision_at_k(s_val, val_internal, k)
+    # Recall into a shortlist of this share of the pool. 20% is the live
+    # operating point (shortlist 150 of a ~750-candidate pool after minWords).
+    m["val_recall@cut"] = recall_at_frac(s_val, val_internal, PREFILTER_CUT)
+    for frac in (0.30, 0.50):
+        m[f"val_recall@{int(frac * 100)}"] = recall_at_frac(s_val, val_internal, frac)
     if teacher_mask.sum() > 10:
         m["val_spearman_vs_teacher"] = float(
             spearmanr(s_val[teacher_mask], p_val_teacher[teacher_mask]).statistic

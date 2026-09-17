@@ -166,3 +166,63 @@ this conservative, better labels *do* buy representable structure.
   several times what any retrain is worth.
 * **Judge this axis on AP/P@10, not AUC.** The two metrics disagree in sign here, and
   the one that matches what the feed does is AP.
+
+---
+
+# Part 3: the two vectors want different objectives
+
+Deploying both vectors selected on `val_ndcg_graded` was a mistake caught after
+the fact. The Jina vector is the quality **gate** and is rightly judged on the
+head of the ranking. The MiniLM vector is a **prefilter**: its only job is to
+hand a shortlist to the paid stage, so anything it drops is lost for good, while
+its ordering within the shortlist is rescored and fused anyway. Those are
+different objectives and they moved in opposite directions on this retrain.
+
+## The production cut, measured not assumed
+
+Recall has to be evaluated at the n where the cut actually happens. Over five
+production requests (2026-09-17) the `X-Prefilter` header reported `hyd=754-755`
+hydrated candidates, of which 11-12 were German and bypassed the stage, and
+`kept=161-162` = `shortlist` 150 + the bypassed. So the cut is **150 of ~743
+non-German candidates, 20.2%** — now `PREFILTER_CUT` in
+`train_internal_vector.py`, to be re-derived whenever `shortlist`,
+`numCandidates` or `minWords` changes.
+
+## What the retrain did to recall
+
+Recall, at that cut, of the posts the paid Jina stage would keep (non-German):
+
+| MiniLM | recall@cut | recall@30% | Spearman vs Jina | fused AUC | fused AP |
+|---|---|---|---|---|---|
+| LIVE (bonsai labels) | **0.375** | 0.510 | 0.544 | 0.816 | 0.509 |
+| NEW (TypeSafe labels) | 0.349 | 0.464 | 0.495 | **0.829** | **0.543** |
+| distilled from the Jina score | **0.375** | **0.531** | 0.566 | 0.806 | 0.499 |
+
+Three findings:
+
+1. **The TypeSafe labels cost 2.6 points of prefilter recall** (paired
+   −0.026 [−0.052, +0.015]) while improving precision@25 from 0.56 to 0.68.
+   Selecting on recall instead of nDCG picks the *same* vector — the labels are
+   the binding constraint, not the hyperparameters.
+2. **Distilling MiniLM from the Jina score maximises recall and destroys
+   fusion.** It is the best prefilter in isolation and drags fused AP to 0.499,
+   *below* Jina alone at 0.523. The `fuse` design in feeds.ts depends on MiniLM
+   being an independent view; making it a cheap Jina mimic removes the thing
+   that made the second opinion worth having. Not shipped.
+3. **End-to-end, the TypeSafe vector still wins.** Simulating the whole path at
+   production geometry — 20.2% shortlist, German bypass, gate 0.86, fusion, show
+   100 of ~162 survivors — the feed is 52% internal against 46%, +0.052
+   [−0.035, +0.138], P(better) = 87%. The recall lost at the shortlist is more
+   than repaid by the better ordering downstream.
+
+So the deployed pair stays as it is. What changed is that the objectives are now
+explicit: `LOC_SELECT_METRIC=val_precision@50` for Jina and `val_recall@cut` for
+MiniLM, wired into run_all.sh, so the next retrain cannot improve the feed's top
+while quietly shrinking what reaches it.
+
+## Caveat
+
+`val_recall@cut` in the trainer measures recall of the *validation label*, not of
+gate-passers — the truer target needs the other space's vector and threshold, which
+a single-space training run does not have. The gate-passer numbers above were
+measured against the trained pair afterwards. Do that before deploying a prefilter.
