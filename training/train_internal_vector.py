@@ -142,6 +142,24 @@ def get_expected_score(r, temperature):
 #   graded - raw v4 loc_score (0-9), neutral in the middle. Best teacher-fidelity but lets
 #            the neutral bulk crowd the internal head (worse internal detection).
 #   legacy - old P(internal)*E[level], rescaled to [0,9].
+#   ramp   - external pinned at 0 exactly as in `band`, but everything above it
+#            moves continuously with P(internal) (2 + 7*P) instead of snapping to
+#            the neutral point or the positive band. Intended for the MiniLM
+#            prefilter: `band` maps every neutral to the same 2.0, which throws
+#            away the ordering among near-internal neutrals.
+#
+#            NOT the default, and not currently deployed. Through the same
+#            dev-split selection as everything else it trades recall for a
+#            cleaner negative pole: recall@cut 0.514 against band's 0.528, and
+#            ext_leak_auc 0.212 against 0.242. End-to-end that was a net loss
+#            (48% internal in the simulated feed against band's 52%), so it is
+#            here as a documented option for a future axis where suppressing the
+#            negative pole matters more than recall, not as an improvement.
+#
+#            A plain P(internal) target is the version to avoid: with external
+#            and neutral both near zero Ridge never learns external is worse,
+#            and the simulated feed showed 18 external posts against band's 13.
+#            Pinning external at 0 is what prevents that.
 TARGET_MODE = os.environ.get("LOC_TARGET_MODE", "band")
 NEU_BAND = float(os.environ.get("LOC_NEU_BAND", "2.0"))
 # Model-selection metric (a key in evaluate()'s dict). Default to the graded
@@ -206,6 +224,15 @@ def get_target_score(r, temperature):
         return get_p_positive(r, temperature) * get_expected_level(r, temperature) * 3.0
     if TARGET_MODE == "legacy":
         return get_p_positive(r, temperature) * get_expected_level(r, temperature) * 3.0
+    if TARGET_MODE == "ramp":
+        lp = r.get("raw_logprobs") or {}
+        a = np.array([lp.get(l, -20.0) for l in VALID_LABELS]) / temperature
+        e = np.exp(a - a.max()); p = e / e.sum()
+        p_pos, p_neg, p_neu = p[0], p[1], p[2]
+        # Argmax-external stays at the floor; everything else ramps with P(positive).
+        if p_neg > max(p_pos, p_neu):
+            return 0.0
+        return NEU_BAND + (POSITIVE_BAND[1] - NEU_BAND) * p_pos
     # band (default): NEGATIVE_LABEL -> 0, neutral -> NEU_BAND, POSITIVE_LABEL -> intensity (6-9)
     c = get_class(r, temperature)
     if c == POSITIVE_LABEL:
@@ -342,7 +369,7 @@ def recall_at_frac(scores, is_relevant, frac):
 
 
 def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
-             val_rel=None, val_external=None):
+             val_rel=None, val_external=None, prefilter_mask=None):
     m = {}
     s_dev = X_dev @ v
     m["dev_spearman_vs_teacher"] = float(spearmanr(s_dev, p_dev).statistic)
@@ -367,7 +394,14 @@ def evaluate(v, X_dev, p_dev, X_val, val_internal, p_val_teacher, teacher_mask,
         m[f"val_precision@{k}"] = precision_at_k(s_val, val_internal, k)
     # Recall into a shortlist of this share of the pool. 20% is the live
     # operating point (shortlist 150 of a ~750-candidate pool after minWords).
-    m["val_recall@cut"] = recall_at_frac(s_val, val_internal, PREFILTER_CUT)
+    # Measured over the candidates the prefilter actually ranks. feeds.ts routes
+    # German around this stage (`bypass`), so German posts are not competing for
+    # the cut and including them misstates it -- they are 1.6% of a live pool
+    # (12 of 755 measured) but 14.6% of this validation set, which moved the
+    # number by 3.6 points. Unset mask = score everything, for spaces with no
+    # bypass.
+    pm = np.ones(len(s_val), bool) if prefilter_mask is None else prefilter_mask
+    m["val_recall@cut"] = recall_at_frac(s_val[pm], val_internal[pm], PREFILTER_CUT)
     for frac in (0.30, 0.50):
         m[f"val_recall@{int(frac * 100)}"] = recall_at_frac(s_val, val_internal, frac)
     if teacher_mask.sum() > 10:
@@ -488,6 +522,9 @@ def main():
     # Graded relevance for the "internal high, external low" objective.
     _rel_by_class = {LABEL_MAP[POSITIVE_LABEL]: 2, LABEL_MAP["neutral"]: 1, LABEL_MAP[NEGATIVE_LABEL]: 0}
     val_rel = np.array([_rel_by_class[int(y)] for y in y_val])
+    # Mirrors looksGerman() in bunny_feed/src/lang.ts: these are the candidates
+    # the free stage is responsible for ranking.
+    prefilter_mask = np.array([("de" not in (r.get("langs") or [])) for r in val_rows])
     print(f"Validation: {len(X_val)} posts, {val_internal.sum()} internal / "
           f"{val_external.sum()} external ({val_internal.mean():.1%} / {val_external.mean():.1%})")
 
@@ -537,7 +574,7 @@ def main():
                 w, _ = fit(X[train_idx], p_all[train_idx])
                 v = w / (np.linalg.norm(w) + 1e-9)
                 m = evaluate(v, X[dev_idx], p_ref[dev_idx], X_val, val_internal,
-                             p_val_teacher, teacher_mask, val_rel, val_external)
+                             p_val_teacher, teacher_mask, val_rel, val_external, prefilter_mask)
                 key = f"{name}_T{T}_W{W}"
                 all_results[key] = m
                 print(f"{key:26s} valAUC_int={m.get('val_auc_internal', float('nan')):.4f} "
@@ -562,7 +599,7 @@ def main():
     w, b = train_ridge(X, p_best, best_l2, w_best_all)
     v = w / (np.linalg.norm(w) + 1e-9)
     final = evaluate(v, X[dev_idx], p_ref[dev_idx], X_val, val_internal,
-                     p_val_teacher, teacher_mask, val_rel, val_external)
+                     p_val_teacher, teacher_mask, val_rel, val_external, prefilter_mask)
     print("Final model (trained on full data; dev metrics no longer held out):")
     for k_, v_ in final.items():
         print(f"  {k_}: {v_:.4f}")

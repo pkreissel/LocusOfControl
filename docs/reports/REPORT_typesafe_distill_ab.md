@@ -192,37 +192,76 @@ non-German candidates, 20.2%** — now `PREFILTER_CUT` in
 
 Recall, at that cut, of the posts the paid Jina stage would keep (non-German):
 
-| MiniLM | recall@cut | recall@30% | Spearman vs Jina | fused AUC | fused AP |
-|---|---|---|---|---|---|
-| LIVE (bonsai labels) | **0.375** | 0.510 | 0.544 | 0.816 | 0.509 |
-| NEW (TypeSafe labels) | 0.349 | 0.464 | 0.495 | **0.829** | **0.543** |
-| distilled from the Jina score | **0.375** | **0.531** | 0.566 | 0.806 | 0.499 |
+| MiniLM | recall@cut | Spearman vs Jina | fused AUC | fused AP |
+|---|---|---|---|---|
+| LIVE (bonsai labels) | **0.375** | 0.544 | 0.816 | 0.509 |
+| NEW (TypeSafe labels) | 0.349 | 0.495 | **0.829** | **0.543** |
+| distilled from the Jina score | **0.380** | 0.566 | 0.806 | 0.499 |
 
-Three findings:
+**That table is measured against a circular target and should not be read as a
+ranking.** "Posts the Jina gate would keep" is the Jina vector's own output, so
+scoring candidates on it rewards whichever candidate best imitates Jina — and
+one of them was trained to do exactly that. It also aims the cheap stage at a
+0.803-AUC judge when a 0.942-AUC one (TypeSafe itself) is available.
 
-1. **The TypeSafe labels cost 2.6 points of prefilter recall** (paired
-   −0.026 [−0.052, +0.015]) while improving precision@25 from 0.56 to 0.68.
-   Selecting on recall instead of nDCG picks the *same* vector — the labels are
-   the binding constraint, not the hyperparameters.
-2. **Distilling MiniLM from the Jina score maximises recall and destroys
-   fusion.** It is the best prefilter in isolation and drags fused AP to 0.499,
-   *below* Jina alone at 0.523. The `fuse` design in feeds.ts depends on MiniLM
-   being an independent view; making it a cheap Jina mimic removes the thing
-   that made the second opinion worth having. Not shipped.
-3. **End-to-end, the TypeSafe vector still wins.** Simulating the whole path at
-   production geometry — 20.2% shortlist, German bypass, gate 0.86, fusion, show
-   100 of ~162 survivors — the feed is 52% internal against 46%, +0.052
-   [−0.035, +0.138], P(better) = 87%. The recall lost at the shortlist is more
-   than repaid by the better ordering downstream.
+Re-measured against three targets that are not Jina's output — TypeSafe's own
+label, TypeSafe's top-20% by P(internal), and the independent Gemini gold label:
 
-So the deployed pair stays as it is. What changed is that the objectives are now
-explicit: `LOC_SELECT_METRIC=val_precision@50` for Jina and `val_recall@cut` for
-MiniLM, wired into run_all.sh, so the next retrain cannot improve the feed's top
-while quietly shrinking what reaches it.
+| MiniLM trained on | Jina gate *(circular)* | TypeSafe label | TypeSafe top-20% | Gemini gold |
+|---|---|---|---|---|
+| LIVE (bonsai) | 0.375 | 0.550 | 0.471 | 0.486 |
+| TypeSafe band (deployed) | 0.354 | 0.475 | 0.482 | **0.514** |
+| TypeSafe P(internal) soft | 0.328 | **0.575** | **0.576** | 0.528 |
+| Jina-score mimic | **0.380** | 0.475 | 0.482 | 0.500 |
+
+The mimic wins only on the target it was trained on and is mediocre on all three
+independent ones. **The prefilter should be distilled from TypeSafe, which is
+what the deployed vector already is.**
+
+## Two claims this report made and had to withdraw
+
+Both came from the same mistake, and both are worth recording because the
+mistake is easy to repeat.
+
+**"Distilling MiniLM from the Jina score maximises recall."** It maximises
+agreement with the Jina gate, which is not the same thing and is what the metric
+was made of. On every non-circular target it is no better than the deployed
+vector.
+
+**"A continuous target (`soft`/`ramp`) beats the 3-band target on recall."**
+Measured in a scratch script that selected hyperparameters by maximising the
+same validation number it then reported. Run through the trainer's dev-split
+selection instead, the ordering reverses:
+
+| MiniLM, all selected on val_recall@cut | recall@cut | ext_leak_auc | e2e % internal |
+|---|---|---|---|
+| band | **0.528** | 0.242 | **52%** |
+| ramp | 0.514 | **0.212** | 48% |
+| P(internal) soft | 0.542* | — | 52%, but 18 external shown vs 13 |
+
+\* the inflated figure; the honest comparison is the band/ramp row pair.
+
+A 500-post validation set used for both selection and reporting cannot resolve
+differences of ±0.015. Treat anything smaller than that as noise on this set.
+
+## What actually changed
+
+Nothing in production. The deployed pair — Jina selected on precision@50, MiniLM
+distilled from TypeSafe on the band target — is the best combination measured,
+and selecting MiniLM on `val_recall@cut` instead of nDCG moves recall 0.514 ->
+0.528 with an identical simulated feed (Δ 0.000 [-0.016, +0.016]), which is not
+worth a redeploy on its own.
+
+What changed is that the objectives are explicit and the metric is honest:
+`LOC_SELECT_METRIC=val_precision@50` for the gate, `val_recall@cut` for the
+prefilter, `PREFILTER_CUT` derived from the production header, and the recall
+metric measured only over the candidates the prefilter actually ranks (German
+bypasses it -- 1.6% of a live pool but 14.6% of this validation set, worth 3.6
+points on the number).
 
 ## Caveat
 
-`val_recall@cut` in the trainer measures recall of the *validation label*, not of
-gate-passers — the truer target needs the other space's vector and threshold, which
-a single-space training run does not have. The gate-passer numbers above were
-measured against the trained pair afterwards. Do that before deploying a prefilter.
+`val_recall@cut` measures recall of the validation label, not of gate-passers.
+That is deliberate after the above: a gate-passer target makes the prefilter
+chase the gate's errors. The gold label is the better reference precisely
+because neither vector was trained on it.
