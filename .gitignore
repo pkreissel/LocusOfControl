@@ -3,50 +3,27 @@
 
 # Environments & caches
 .venv/
+.venv_de/
+tmp_venv/
 __pycache__/
 *.pyc
 .DS_Store
+node_modules/
 
-# Archived experiments and one-off scripts
-backup/
+# Superseded work. Kept on disk, deliberately NOT tracked: archive/ is where
+# anything that no longer serves the live feed goes, and tracking it would
+# defeat the point of having it. Nothing in here is needed to reproduce
+# production -- if it is, it does not belong in archive/.
+archive/
 
-# Data, results and model artifacts (regenerable via the pipeline)
-*.jsonl
-*.npz
-*.npy
-!internal_vector.npy
-network_dids.json
-_/
-loc-classifier-*/
-results*/
-results*.json
-*report.json
-vector_errors.json
-*.log
-nohup.out
+# Corpora, embedding caches, trained vectors and sweep results. All regenerable
+# by training/run_all.sh, and large. The deployed vectors are committed as JSON
+# under bunny_feed/src/ instead, which is the only copy production reads.
+training/data/
+research/data/
 
-# Bunny edge worker
-bunny_feed/node_modules/
+# Bunny edge worker build output
 bunny_feed/dist/
 
-# Fine-tuned reranker checkpoints (tens of GB, retrain via train_jina_reranker.py)
-loc-reranker-*/
-
-# Per-experiment vector sidecars (the .npy they calibrate is ignored too).
-# The two committed ones describe the vectors that ship, so keep them.
-*_vector_*_meta.json
-external_vector_meta.json
-!internal_vector_meta.json
-!internal_vector_bonsai_v2_meta.json
-
-# Snapshots of previous runs kept for A/B comparison
+# Local snapshot of the previously deployed vector, for a fast manual rollback
 *.prev.json
-old_vector.json
-old_metrics.txt
-reposts_analysis.json
-
-# Local backup copies of regenerable datasets
-*.bak
-
-# Language flags for the offline evaluation (regenerate: bunny_feed/dump_lang_flags.ts)
-lang_flags_*.json
