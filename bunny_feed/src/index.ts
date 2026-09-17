@@ -1,5 +1,5 @@
 import { jwtDecode } from 'jwt-decode';
-import { getEmbeddingsBatched, EMBEDDING_MODEL } from './jina';
+import { getEmbeddingsBatched, EMBEDDING_MODEL, JINA_TIMEOUT_MS } from './jina';
 import { decodeEmbedding } from './minilm';
 import { fuseByRank } from './fuse';
 import { resolveFeed, ALL_SCORERS, bypassBudget, type FeedConfig } from './feeds';
@@ -231,11 +231,113 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 // order (already the behaviour when the rerank fails). Both finish the request,
 // and therefore both land in feed_logs with `errors` set.
 //
-// Sized off measured latency with headroom, not guessed: generate runs 1.7-3.0s
-// at num_candidates 1000 and rank ~0.5s. These are the point past which waiting
+// Sized against the request's own budget, not each call in isolation. The whole
+// pipeline has 10s; generate, embed and rank run in series inside it, so a
+// per-call deadline is only honest if the deadlines can all be paid at once. 8s
+// for generate could not be: it left 2s for everything downstream, which means
+// the deadline would never have fired before the isolate was killed -- exactly
+// the silent stall it exists to prevent.
+//
+// Against measured latency, generate runs 1.7-3.0s at num_candidates 1000 and
+// rank ~0.5s. 4s covers the top of the generate range with margin and still
+// leaves ~6s for embed, rank and the write. This is the point past which waiting
 // longer serves the reader worse than serving what we already have.
-const GE_GENERATE_TIMEOUT_MS = 8000;
+const GE_GENERATE_TIMEOUT_MS = 4000;
 const GE_RANK_TIMEOUT_MS = 6000;
+
+// A generate that fails *early* leaves budget on the table, and the failures that
+// actually show up here -- a dropped connection, a 502 from a rolling deploy, a
+// 503 -- are the kind a second call answers. So retry immediately, with every
+// attempt sharing the deadline above rather than each getting its own: the stage
+// can never run longer than the request is sized against, and the only thing a
+// retry spends is time the first failure did not use.
+//
+// Two conditions gate it, and both are about "early". The failure must be one
+// that can differ next time (a 4xx is the same request being wrong, and repeating
+// it just burns latency), and at least GE_GENERATE_RETRY_MIN_MS of the budget must
+// remain. That floor is 3.0s, the top of the measured generate range: a retry
+// either gets a window a generate has actually been observed to finish in, or it
+// does not run at all -- a retry that is going to be aborted at the deadline only
+// delays the empty pool the reader is already getting. Inside a 4s budget that
+// makes "early" mean "failed within a second", which is what the failures worth
+// retrying look like: a refused connection or an instant 502 lands in tens of
+// milliseconds. A timeout is by construction not early -- it consumed the whole
+// budget -- so it is never retried.
+const GE_GENERATE_MAX_ATTEMPTS = 2;
+const GE_GENERATE_RETRY_MIN_MS = 3000;
+const GE_GENERATE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+// --- One budget for the whole request --------------------------------------
+//
+// The caps above, and JINA_TIMEOUT_MS, are per-call stall guards, each sized off
+// its own call's measured latency. Summed, they bound nothing: the stages run in
+// series inside a request that has 10s, so deadlines that are each individually
+// payable still describe a request the platform kills before any of them fires --
+// the silent stall they exist to prevent, reintroduced by the deadlines
+// themselves.
+//
+// So the caps stay what they are ("longer than this and the call is hung") and
+// the ceiling is enforced once, here: every stage takes min(its cap, what is left
+// of the request). A stage that cannot get enough to finish does not start. It
+// takes the failure path it already has -- empty pool, cached scores only, the
+// vector's own order, no cursor -- and names itself in `errors`, which is the same
+// outcome as aborting at the deadline minus the time spent waiting for it.
+const REQUEST_BUDGET_MS = 10000;
+// Held out of the budget for the work after the last stage: serializing the body,
+// the public skeleton cache put, the response. None of that is deadlined, so it
+// has to come out of the budget rather than off the end of it.
+const RESPONSE_RESERVE_MS = 500;
+
+// Floors. Below these a stage cannot finish even at the fastest it has been
+// observed to run, so starting it would spend the reader's remaining time to
+// reach the same failure path, later. Measured: generate 1.7-3.0s, one Jina
+// round 0.7-3.9s, rank ~0.5s.
+const GE_GENERATE_MIN_MS = 1700;
+const JINA_MIN_MS = 700;
+const GE_RANK_MIN_MS = 500;
+
+// Cap on any single blocking DB call. The driver bounds one HTTP attempt
+// (DB_REQUEST_TIMEOUT_MS) but not the retry sequence around it, and these calls
+// take no AbortSignal, so they are bounded at the call site instead. An indexed
+// round-trip measures ~30ms, so 1.5s only fires when the DB is not answering --
+// including the cold-replica attach that has been observed to take tens of
+// seconds. Losing that race is the intended outcome under a 10s budget: a cold
+// attach cannot be waited out and still leave time for a feed, so the request
+// continues without exclusion, or without a cursor, instead of being killed
+// mid-wait having logged nothing.
+const DB_STAGE_TIMEOUT_MS = 1500;
+
+type Budget = { remaining: () => number; slice: (cap: number) => number };
+
+function requestBudget(t0: number): Budget {
+  const deadline = t0 + REQUEST_BUDGET_MS - RESPONSE_RESERVE_MS;
+  const remaining = () => Math.max(0, deadline - Date.now());
+  return { remaining, slice: (cap: number) => Math.min(cap, remaining()) };
+}
+
+// Bound a call that has no AbortSignal of its own -- the DB helpers -- against the
+// budget. The work is not cancelled, only stopped being waited on: the timer
+// callback rejects this wrapper and issues no fetch, so nothing escapes the
+// request's async context (which is what breaks `fetch` on this runtime -- see the
+// driver note in db.ts). Safe only because every call wrapped below already has a
+// defined outcome for "did not answer in time".
+function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  // The call is already in flight by the time we get here (it is an argument), so
+  // something has to stay subscribed to it whatever happens next. Once the timer
+  // wins the race nobody is, and a rejection arriving after that is an unhandled
+  // one -- an isolate-level event raised by a call we had already given up on.
+  // This second subscription absorbs exactly that; it is a separate branch and
+  // does not take the rejection away from the caller below.
+  // Nothing to log here: if the caller was still waiting it logs the rejection
+  // itself, and if the timer won, the missed deadline was already logged there.
+  p.catch(() => {});
+  if (ms <= 0) return Promise.reject(new Error(`${label}: no budget left`));
+  let timer: any;
+  const guard = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label}: deadline after ${ms}ms`)), ms);
+  });
+  return Promise.race([p, guard]).finally(() => clearTimeout(timer));
+}
 
 // Render one upstream failure for the `errors` column. AbortSignal.timeout rejects
 // with a TimeoutError, which is the whole point of the column, so name it as such
@@ -368,11 +470,22 @@ type ScoreResult = {
   failedChunks: number;
 };
 
-async function scoreCandidates(cands: Candidate[], apiKey: string, feed: FeedConfig): Promise<ScoreResult> {
+async function scoreCandidates(
+  cands: Candidate[],
+  apiKey: string,
+  feed: FeedConfig,
+  budget: Budget,
+  errs: string[],
+): Promise<ScoreResult> {
   const scores: (number | null)[] = new Array(cands.length).fill(null);
 
   // Batch-load cached scores. Best-effort: a DB error just means "all miss".
-  const cached = await getCachedScores(cands.map(c => c.uri), scoreCacheVersion(feed.scorer))
+  // Bounded like every other DB call even though missing the cache makes the Jina
+  // stage bigger, not smaller -- a read that has not answered in DB_STAGE_TIMEOUT_MS
+  // was never going to return hits in time to save anything.
+  const cached = await withDeadline(
+    getCachedScores(cands.map(c => c.uri), scoreCacheVersion(feed.scorer)),
+    budget.slice(DB_STAGE_TIMEOUT_MS), 'score-cache-read')
     .catch((e: any) => { console.error("[score cache] read failed:", errChain(e)); return new Map<string, number>(); });
 
   // De-duplicate misses by uri: Jina is billed per unique text, and SQLite
@@ -395,6 +508,17 @@ async function scoreCandidates(cands: Candidate[], apiKey: string, feed: FeedCon
 
   let tokens = 0, chunks = 0, failedChunks = 0;
   if (missUris.length > 0) {
+    // Out of budget before the billed stage: serve whatever the cache gave us
+    // (possibly nothing, which is an empty feed) and name it, rather than paying
+    // Jina for embeddings that arrive after the request is gone. Deliberately not
+    // the rethrow below, even with no hits: nothing is wrong with Jina here.
+    const jinaMs = budget.slice(JINA_TIMEOUT_MS);
+    if (jinaMs < JINA_MIN_MS) {
+      console.error(`[score cache] skipping Jina: ${jinaMs}ms of budget left, serving ${hits} cached score(s)`);
+      errs.push('jina:no-budget');
+      return { scores, tokens: 0, hits, misses: missUris.length, chunks: 0, failedChunks: 0 };
+    }
+
     // getEmbeddingsBatched throws only when EVERY chunk failed (a total Jina
     // outage). Now that the cache is load-bearing we can ride that out: if some
     // candidates were served from cache, rank those instead of failing the whole
@@ -402,7 +526,7 @@ async function scoreCandidates(cands: Candidate[], apiKey: string, feed: FeedCon
     // the handler return its 500 as before.
     let res: Awaited<ReturnType<typeof getEmbeddingsBatched>>;
     try {
-      res = await getEmbeddingsBatched(missTexts, apiKey);
+      res = await getEmbeddingsBatched(missTexts, apiKey, jinaMs);
     } catch (e: any) {
       if (hits === 0) throw e;
       console.error(`[score cache] all Jina chunks failed; serving ${hits} cached score(s) only:`, e?.message ?? String(e));
@@ -448,7 +572,7 @@ async function scoreCandidates(cands: Candidate[], apiKey: string, feed: FeedCon
         toStore.push({ uri: missUris[k], score: scorer.score(emb).probability, version });
       }
     }
-    await putScores(toStore)
+    await withDeadline(putScores(toStore), budget.slice(DB_STAGE_TIMEOUT_MS), 'score-cache-write')
       .catch((e: any) => console.error("[score cache] write failed:", errChain(e)));
   }
 
@@ -479,6 +603,9 @@ async function handleRequest(request: Request): Promise<Response> {
   // --- FEED GENERATOR SKELETON ENDPOINT ---
   if (url.pathname === '/xrpc/app.bsky.feed.getFeedSkeleton') {
     const t0 = Date.now();
+    // Everything below slices its deadline out of this, so the stages can only
+    // ever add up to a request the platform will let finish.
+    const budget = requestBudget(t0);
     try {
       const apiKey = getEnv('JINA_API_KEY') || 'MISSING_API_KEY';
       if (!apiKey || apiKey === 'MISSING_API_KEY') {
@@ -574,7 +701,8 @@ async function handleRequest(request: Request): Promise<Response> {
       // regeneration doesn't repeat them.
       const decoded = decodeCursor(startCursor);
       if (decoded) {
-        const session = await getFeedSession(decoded.sessionId)
+        const session = await withDeadline(
+          getFeedSession(decoded.sessionId), budget.slice(DB_STAGE_TIMEOUT_MS), 'session-read')
           .catch((e: any) => { console.error("[getFeedSkeleton] session read failed:", errChain(e)); return null; });
         const fresh = !!session && (Date.now() - session.createdAt) < SESSION_TTL_MS;
         const ownerOk = !!session && (session.did || null) === (userDid || null);
@@ -613,7 +741,8 @@ async function handleRequest(request: Request): Promise<Response> {
       // which a reload should keep showing anyway. Best-effort: any read failure
       // falls through to a fresh generation.
       if (userDid && !startCursor) {
-        const latest = await getLatestFeedSession(userDid)
+        const latest = await withDeadline(
+          getLatestFeedSession(userDid), budget.slice(DB_STAGE_TIMEOUT_MS), 'latest-session-read')
           .catch((e: any) => { console.error("[getFeedSkeleton] latest-session read failed:", errChain(e)); return null; });
         if (latest && latest.uris.length > 0 && (Date.now() - latest.createdAt) < START_REUSE_TTL_MS) {
           const page = latest.uris.slice(0, limit);
@@ -657,11 +786,23 @@ async function handleRequest(request: Request): Promise<Response> {
       // Score-cache diagnostics, surfaced in the [feed] log line and on the
       // response headers so cache warming can be verified without DB access.
       let embedHits = 0, embedMisses = 0, embedChunks = 0, embedFailedChunks = 0;
+      // Stage failures seen on this request, joined into the feed_logs `errors`
+      // column. Empty is the normal case and stays null in the row. Declared here
+      // rather than at the gather stage because the seen read below is the first
+      // thing that can fail, and a request that silently stopped excluding posts
+      // is exactly the kind of degradation this column exists to show.
+      const errs: string[] = [];
       let tS_start = Date.now();
       let excludeUris: string[] = [];
       if (userDid) {
-        excludeUris = await getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS)
-          .catch((e: any) => { console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e)); return []; });
+        excludeUris = await withDeadline(
+          getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS),
+          budget.slice(DB_STAGE_TIMEOUT_MS), 'seen-uris')
+          .catch((e: any) => {
+            console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e));
+            errs.push(stageErr('seen-uris', e));
+            return [];
+          });
       }
       tSeen = Date.now() - tS_start;
 
@@ -681,9 +822,6 @@ async function handleRequest(request: Request): Promise<Response> {
       let candRaw = 0, candShort = 0;
       let preHydrated = 0, preKept = 0, preFloor = 0, preFellBack = false;
       let preBypass = 0, preBypassDropped = 0;
-      // Stage failures seen on this request, joined into the feed_logs `errors`
-      // column. Empty is the normal case and stays null in the row.
-      const errs: string[] = [];
       try {
         const buildBody = (gens: { name: string; weight: number }[]) => {
           const b: any = {
@@ -722,20 +860,57 @@ async function handleRequest(request: Request): Promise<Response> {
           bodies.push(buildBody([{ name: 'random_posts', weight: 1.0 }]));
         }
 
+        // What this stage actually gets: its own cap, or what the request has
+        // left, whichever is smaller. Computed once and shared by every batch and
+        // every retry inside them, so the fan-out cannot multiply the deadline.
+        const genBudgetMs = budget.slice(GE_GENERATE_TIMEOUT_MS);
+        const skipGenerate = genBudgetMs < GE_GENERATE_MIN_MS;
+        if (skipGenerate) {
+          console.error(`[getFeedSkeleton] skipping GE generate: ${genBudgetMs}ms of budget left`);
+          errs.push('ge-generate:no-budget');
+        }
+
         // One slow or failing call must not lose the others' candidates.
-        const batches = await Promise.all(bodies.map(async (body) => {
-          try {
-            const r = await fetch('https://api.greenearth.social/candidates/generate', {
-              method: 'POST', headers: geHeaders, body: JSON.stringify(body),
-              signal: AbortSignal.timeout(GE_GENERATE_TIMEOUT_MS),
-            });
-            if (!r.ok) throw new Error(`GE Generate failed: ${r.status}`);
-            return (await r.json()).candidates || [];
-          } catch (e: any) {
-            console.error("[getFeedSkeleton] GE generate call failed:", e?.message || String(e));
-            errs.push(stageErr('ge-generate', e));
-            return [];
+        const batches = skipGenerate ? [] : await Promise.all(bodies.map(async (body) => {
+          const payload = JSON.stringify(body);
+          const tGen = Date.now();
+          let lastErr: any;
+          for (let attempt = 1; attempt <= GE_GENERATE_MAX_ATTEMPTS; attempt++) {
+            const remaining = genBudgetMs - (Date.now() - tGen);
+            if (remaining <= 0) break;
+            try {
+              const r = await fetch('https://api.greenearth.social/candidates/generate', {
+                method: 'POST', headers: geHeaders, body: payload,
+                // Whatever is left of the shared budget, so attempt 2 inherits
+                // the deadline rather than restarting it.
+                signal: AbortSignal.timeout(remaining),
+              });
+              if (!r.ok) {
+                const httpErr: any = new Error(`GE Generate failed: ${r.status}`);
+                httpErr.retryable = GE_GENERATE_RETRYABLE_STATUS.has(r.status);
+                throw httpErr;
+              }
+              return (await r.json()).candidates || [];
+            } catch (e: any) {
+              lastErr = e;
+              const elapsed = Date.now() - tGen;
+              // A thrown fetch/network error carries no flag and is retryable; a
+              // status we classified carries its verdict; a timeout is not early.
+              const retryable = e?.retryable !== false
+                && e?.name !== 'TimeoutError' && e?.name !== 'AbortError';
+              if (!retryable || attempt === GE_GENERATE_MAX_ATTEMPTS
+                  || genBudgetMs - elapsed < GE_GENERATE_RETRY_MIN_MS) break;
+              console.warn(`[getFeedSkeleton] GE generate failed after ${elapsed}ms (attempt ${attempt}/${GE_GENERATE_MAX_ATTEMPTS}), retrying:`, e?.message || String(e));
+            }
           }
+          // Only a batch that failed every attempt it was allowed lands in `errors`.
+          // A retry that succeeded produced candidates, so counting it here would
+          // both overstate the failure rate and, because an empty pool is only named
+          // `ge-generate:empty` when nothing else was recorded, mask a genuinely
+          // empty one. Retries are visible in the console.warn above instead.
+          console.error("[getFeedSkeleton] GE generate call failed:", lastErr?.message || String(lastErr));
+          errs.push(stageErr('ge-generate', lastErr));
+          return [];
         }));
 
         const seenUri = new Set<string>();
@@ -862,7 +1037,7 @@ async function handleRequest(request: Request): Promise<Response> {
         }
 
         // (3b) Reuse cached scores; only cache-missed posts are sent to Jina.
-        const scored = await scoreCandidates(paidPool, apiKey, feedConfig);
+        const scored = await scoreCandidates(paidPool, apiKey, feedConfig, budget, errs);
         embedHits = scored.hits;
         embedMisses = scored.misses;
         embedChunks = scored.chunks;
@@ -915,12 +1090,22 @@ async function handleRequest(request: Request): Promise<Response> {
 
         tEmbed = Date.now() - tE_start;
         
+        // Fixed once, so the branch below and the signal it hands the fetch are
+        // deciding on the same number.
+        const rankMs = budget.slice(GE_RANK_TIMEOUT_MS);
         if (filteredCandidates.length > 0 && feedConfig.rankBy === 'score') {
           // The vector IS the editorial criterion for this feed, and
           // filteredCandidates is already sorted by it. Handing that order to
           // GE's engagement ranker scrambles it — measured Spearman 0.277
           // between served rank and assist score — so skip the rerank call
           // entirely. Also saves a round-trip.
+          tRank = 0;
+        } else if (filteredCandidates.length > 0 && rankMs < GE_RANK_MIN_MS) {
+          // No budget left to rank in. The vector's own order is already the
+          // fallback whenever the rerank fails, so take it now instead of paying
+          // for a call that would be aborted before it returned.
+          console.error(`[getFeedSkeleton] skipping GE rank: ${rankMs}ms of budget left`);
+          errs.push('ge-rank:no-budget');
           tRank = 0;
         } else if (filteredCandidates.length > 0) {
           const tR_start = Date.now();
@@ -939,7 +1124,7 @@ async function handleRequest(request: Request): Promise<Response> {
                 ],
                 user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
               }),
-              signal: AbortSignal.timeout(GE_RANK_TIMEOUT_MS),
+              signal: AbortSignal.timeout(rankMs),
             });
             if (!rankRes.ok) errs.push(`ge-rank:http-${rankRes.status}`);
             if (rankRes.ok) {
@@ -978,7 +1163,16 @@ async function handleRequest(request: Request): Promise<Response> {
       let sessionId = '';
       if (rankedUris.length > 0) {
         sessionId = crypto.randomUUID();
-        sessionStored = await putFeedSession(sessionId, userDid, rankedUris);
+        // A write that misses its slice yields no cursor -- the client gets page 1
+        // and a refresh regenerates -- which is already what a failed write does.
+        sessionStored = await withDeadline(
+          putFeedSession(sessionId, userDid, rankedUris),
+          budget.slice(DB_STAGE_TIMEOUT_MS), 'session-write')
+          .catch((e: any) => {
+            console.error("[getFeedSkeleton] session write failed:", errChain(e));
+            errs.push(stageErr('session-write', e));
+            return false;
+          });
       }
 
       // Opportunistically prune expired sessions so the table stays bounded.

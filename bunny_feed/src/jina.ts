@@ -8,9 +8,17 @@ export const EMBEDDING_MODEL = 'jina-embeddings-v5-text-small';
 // them) while a hang stalls the whole request until the platform kills it,
 // logging nothing. Generous against measured latency -- a 150-text batch embeds
 // in ~0.7-3.9s -- since this is a stall guard, not a latency target.
-const JINA_TIMEOUT_MS = 15000;
+// Overridable per call, because it is only half the answer: the request that
+// contains this one has its own budget, and index.ts hands down whatever is left
+// of it (see requestBudget there). The constant is the stall guard; the argument
+// is the ceiling.
+export const JINA_TIMEOUT_MS = 15000;
 
-export async function getEmbeddings(texts: string[], apiKey: string): Promise<{ embeddings: number[][]; tokens: number }> {
+export async function getEmbeddings(
+  texts: string[],
+  apiKey: string,
+  timeoutMs: number = JINA_TIMEOUT_MS,
+): Promise<{ embeddings: number[][]; tokens: number }> {
   const response = await fetch('https://api.jina.ai/v1/embeddings', {
     method: 'POST',
     headers: {
@@ -22,7 +30,7 @@ export async function getEmbeddings(texts: string[], apiKey: string): Promise<{ 
       task: 'classification',
       input: texts.map(t => t.slice(0, 2000))
     }),
-    signal: AbortSignal.timeout(JINA_TIMEOUT_MS)
+    signal: AbortSignal.timeout(timeoutMs)
   });
   if (!response.ok) {
     const text = await response.text();
@@ -60,6 +68,7 @@ const JINA_MIN_BATCH = 32;
 export async function getEmbeddingsBatched(
   texts: string[],
   apiKey: string,
+  timeoutMs: number = JINA_TIMEOUT_MS,
 ): Promise<{ embeddings: (number[] | null)[]; tokens: number; chunks: number; failedChunks: number }> {
   const embeddings: (number[] | null)[] = new Array(texts.length).fill(null);
   if (texts.length === 0) return { embeddings, tokens: 0, chunks: 0, failedChunks: 0 };
@@ -69,7 +78,7 @@ export async function getEmbeddingsBatched(
   const ranges: [number, number][] = [];
   for (let i = 0; i < texts.length; i += size) ranges.push([i, Math.min(i + size, texts.length)]);
 
-  const settled = await Promise.allSettled(ranges.map(([s, e]) => getEmbeddings(texts.slice(s, e), apiKey)));
+  const settled = await Promise.allSettled(ranges.map(([s, e]) => getEmbeddings(texts.slice(s, e), apiKey, timeoutMs)));
 
   let tokens = 0;
   let failedChunks = 0;
