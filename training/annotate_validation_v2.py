@@ -11,6 +11,18 @@ Run: uv run --with google-genai --with python-dotenv --with tqdm python annotate
 
 import json
 import os
+
+# Data lives in training/data/, resolved against this file rather than the
+# caller's cwd: run_all.sh, an editor and a cron job all invoke these scripts
+# from different directories, and a bare relative default silently creates a
+# second, empty corpus instead of failing. Env overrides still win, and a
+# relative override still resolves against cwd -- deliberately, so a one-off
+# experiment can point at a file next to it.
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
+
 import time
 
 from dotenv import load_dotenv
@@ -20,8 +32,8 @@ from tqdm import tqdm
 
 from label_prompts import axis_labels, get_validation_prompt, prompt_version
 
-INPUT_FILE = os.environ.get("LOC_VAL_INPUT", "dataset_validation_gemini.jsonl")
-OUTPUT_FILE = os.environ.get("LOC_VAL_OUTPUT", "dataset_validation_gemini_v2.jsonl")
+INPUT_FILE = os.environ.get("LOC_VAL_INPUT", _d("dataset_validation_gemini.jsonl"))
+OUTPUT_FILE = os.environ.get("LOC_VAL_OUTPUT", _d("dataset_validation_gemini_v2.jsonl"))
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 

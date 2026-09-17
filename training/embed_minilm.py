@@ -25,6 +25,18 @@ Set LOC_EMBED_ONLY=synth:<file>.jsonl to embed a counterexample file instead
 
 import os
 
+# Data lives in training/data/, resolved against this file rather than the
+# caller's cwd: run_all.sh, an editor and a cron job all invoke these scripts
+# from different directories, and a bare relative default silently creates a
+# second, empty corpus instead of failing. Env overrides still win, and a
+# relative override still resolves against cwd -- deliberately, so a one-off
+# experiment can point at a file next to it.
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
+
+
 import numpy as np
 import torch
 from transformers import AutoModel, AutoTokenizer
@@ -36,9 +48,9 @@ MODEL = "sentence-transformers/all-MiniLM-L12-v2"
 # 0.8% of candidates over the window, which would then not match what the edge sees.
 MAX_LEN = 128
 
-TRAIN_OUT = os.environ.get("LOC_EMB_CACHE", "embeddings_bonsai_v2_minilm.npz")
-INT_OUT = os.environ.get("LOC_INT_EMB_CACHE", "embeddings_interactions_minilm.npz")
-VAL_OUT = os.environ.get("LOC_VAL_EMB_CACHE", "embeddings_gemini_minilm_v2.npz")
+TRAIN_OUT = os.environ.get("LOC_EMB_CACHE", _d("embeddings_lmstudio_soft_minilm.npz"))
+INT_OUT = os.environ.get("LOC_INT_EMB_CACHE", _d("embeddings_interactions_minilm.npz"))
+VAL_OUT = os.environ.get("LOC_VAL_EMB_CACHE", _d("embeddings_gemini_minilm_v2.npz"))
 EMBED_ONLY = os.environ.get("LOC_EMBED_ONLY", "")
 
 

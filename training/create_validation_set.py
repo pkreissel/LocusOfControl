@@ -1,5 +1,17 @@
 import json
 import os
+
+# Data lives in training/data/, resolved against this file rather than the
+# caller's cwd: run_all.sh, an editor and a cron job all invoke these scripts
+# from different directories, and a bare relative default silently creates a
+# second, empty corpus instead of failing. Env overrides still win, and a
+# relative override still resolves against cwd -- deliberately, so a one-off
+# experiment can point at a file next to it.
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
+
 import time
 import random
 from tqdm import tqdm
@@ -9,8 +21,8 @@ from google.genai import types
 
 from label_prompts import get_validation_prompt, prompt_version
 
-INPUT_FILE = "dataset_raw.jsonl"
-OUTPUT_FILE = "dataset_validation_gemini.jsonl"
+INPUT_FILE = _d("dataset_raw.jsonl")
+OUTPUT_FILE = _d("dataset_validation_gemini.jsonl")
 NUM_VALIDATION = 500
 
 def main():

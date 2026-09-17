@@ -1,4 +1,9 @@
 import os
+
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
 import json
 import time
 from atproto import Client
@@ -60,7 +65,7 @@ def main():
     network_dids_list = list(network_dids)
     print(f"\nTotal unique DIDs in collected network: {len(network_dids_list)}")
     
-    with open('network_dids.json', 'w') as f:
+    with open(_d('network_dids.json'), 'w') as f:
         json.dump(network_dids_list, f, indent=2)
     print("Saved network to network_dids.json")
 

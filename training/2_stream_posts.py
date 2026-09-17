@@ -3,6 +3,18 @@ import json
 import websockets
 from tqdm import tqdm
 import os
+
+# Data lives in training/data/, resolved against this file rather than the
+# caller's cwd: run_all.sh, an editor and a cron job all invoke these scripts
+# from different directories, and a bare relative default silently creates a
+# second, empty corpus instead of failing. Env overrides still win, and a
+# relative override still resolves against cwd -- deliberately, so a one-off
+# experiment can point at a file next to it.
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
+
 import re
 import time
 
@@ -11,7 +23,7 @@ JETSTREAM_URI = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollectio
 
 # Configure via env; defaults reproduce the original unfiltered collection.
 TARGET_POST_COUNT = int(os.environ.get("LOC_TARGET_POSTS", "5000"))
-OUTPUT_FILE = os.environ.get("LOC_RAW_OUTPUT", "dataset_raw.jsonl")
+OUTPUT_FILE = os.environ.get("LOC_RAW_OUTPUT", _d("dataset_raw.jsonl"))
 # Regex a post's text must match to enter the buffer at all. Empty = keep all.
 # For the assist axis: LOC_TEXT_FILTER='\\?' keeps only posts asking something.
 TEXT_FILTER = os.environ.get("LOC_TEXT_FILTER", "")
@@ -51,11 +63,11 @@ KEEP_ON_LIKE = ENGAGEMENT in ("any", "like")
 KEEP_ON_REPLY = ENGAGEMENT in ("any", "reply")
 
 async def stream_posts():
-    if not os.path.exists('network_dids.json'):
+    if not os.path.exists(_d('network_dids.json')):
         print("network_dids.json not found. Run 1_fetch_network.py first.")
         return
 
-    with open('network_dids.json', 'r') as f:
+    with open(_d('network_dids.json'), 'r') as f:
         network_dids = set(json.load(f))
     
     print(f"Loaded {len(network_dids)} DIDs from network.")

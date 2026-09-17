@@ -15,26 +15,38 @@ Run: uv run --with numpy --with scipy --with scikit-learn --with torch --with tr
 import json
 import os
 
+# Data lives in training/data/, resolved against this file rather than the
+# caller's cwd: run_all.sh, an editor and a cron job all invoke these scripts
+# from different directories, and a bare relative default silently creates a
+# second, empty corpus instead of failing. Env overrides still win, and a
+# relative override still resolves against cwd -- deliberately, so a one-off
+# experiment can point at a file next to it.
+DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _d(name):
+    return os.path.join(DATA, name)
+
+
+
 import numpy as np
 from scipy.stats import spearmanr
 from sklearn.linear_model import Ridge
 from sklearn.metrics import average_precision_score, ndcg_score, roc_auc_score
 
 # Overridable to train on a different teacher dataset (see README):
-LMSTUDIO_FILE = os.environ.get("LOC_TEACHER_FILE", "dataset_annotated_lmstudio_soft.jsonl")
+LMSTUDIO_FILE = os.environ.get("LOC_TEACHER_FILE", _d("dataset_annotated_typesafe_g3g.jsonl"))
 # Validation posts + embedding row order. Override for a different axis: the assist
 # pipeline points these at its own Gemini-labelled set (helpful/inert/neutral).
-GEMINI_FILE = os.environ.get("LOC_VAL_FILE", "dataset_validation_gemini.jsonl")
+GEMINI_FILE = os.environ.get("LOC_VAL_FILE", _d("dataset_validation_gemini.jsonl"))
 VAL_LABELS_FILE = os.environ.get("LOC_VAL_LABELS_FILE")  # optional uri->loc_label override
-INTERACTIONS_FILE = "dataset_interactions.jsonl"
-CACHE_LMSTUDIO_EMBS = os.environ.get("LOC_EMB_CACHE", "embeddings_lmstudio_soft_v3_jina.npz") # Updated cache name for v3
+INTERACTIONS_FILE = _d("dataset_interactions.jsonl")
+CACHE_LMSTUDIO_EMBS = os.environ.get("LOC_EMB_CACHE", _d("embeddings_lmstudio_soft_v3_jina.npz")) # Updated cache name for v3
 # Env-configurable like every other cache here: training in a different embedding
 # space (e.g. Green Earth's hydrated MiniLM vectors, built by embed_minilm.py)
 # needs *all three* caches redirected, and this one being hardcoded meant the
 # interaction rows silently arrived as 1024-dim Jina vectors.
-CACHE_INTERACTIONS_EMBS = os.environ.get("LOC_INT_EMB_CACHE", "embeddings_interactions_jina.npz")
-CACHE_GEMINI_EMBS = os.environ.get("LOC_VAL_EMB_CACHE", "embeddings_gemini_jina.npz")
-VECTOR_OUT = os.environ.get("LOC_VECTOR_OUT", "internal_vector.npy")
+CACHE_INTERACTIONS_EMBS = os.environ.get("LOC_INT_EMB_CACHE", _d("embeddings_interactions_jina.npz"))
+CACHE_GEMINI_EMBS = os.environ.get("LOC_VAL_EMB_CACHE", _d("embeddings_val_loc_xy.npz"))
+VECTOR_OUT = os.environ.get("LOC_VECTOR_OUT", _d("internal_vector.npy"))
 # Identifies the space these embeddings live in. Recorded in the vector's
 # _meta.json and exported into bunny_feed/src/*.json, where it is the only
 # statement of which model a deployed vector may be scored against -- so it
@@ -504,16 +516,19 @@ def main():
 
     np.save(VECTOR_OUT, v)
     stem = VECTOR_OUT[:-4] if VECTOR_OUT.endswith(".npy") else VECTOR_OUT
+    # results_ prefixes the *basename*: VECTOR_OUT now carries a directory, and
+    # f"results_{stem}" on a path produces "results_/abs/path" and then fails.
+    results_path = os.path.join(os.path.dirname(stem), f"results_{os.path.basename(stem)}.json")
     with open(f"{stem}_meta.json", "w") as f:
         json.dump({"scale": float(np.linalg.norm(w)), "bias": float(b),
                    "temperature": best_T, "l2_reg": best_l2,
                    "embedding_model": EMBEDDING_MODEL,
                    "embedding_task": EMBEDDING_TASK}, f, indent=2)
-    with open(f"results_{stem}.json", "w") as f:
+    with open(results_path, "w") as f:
         json.dump({"sweep": all_results, "best": best_key,
                    "final_full_data": final}, f, indent=2)
     print(f"\nSaved {VECTOR_OUT} ({len(v)}-dim, unit norm), {stem}_meta.json "
-          f"and results_{stem}.json")
+          f"and {results_path}")
 
 
 if __name__ == "__main__":
