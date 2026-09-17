@@ -42,6 +42,13 @@ jobs:
       - name: Install Python Audit Tool
         run: pip install pip-audit
 
-      - name: Audit Python Packages
-        working-directory: ./backend
+      # Two requirements.txt now: the local review app and the training
+      # pipeline. Both are audited; neither runs in production (bunny_feed is a
+      # Deno edge script with no Python), so this is about the dev machine.
+      - name: Audit Python Packages (local review app)
+        working-directory: ./local/backend
+        run: pip-audit -r requirements.txt --ignore-vuln PYSEC-2026-3552 --ignore-vuln PYSEC-2026-3553 --ignore-vuln PYSEC-2026-3554 --ignore-vuln GHSA-537c-gmf6-5ccf
+
+      - name: Audit Python Packages (training)
+        working-directory: ./training
         run: pip-audit -r requirements.txt --ignore-vuln PYSEC-2026-3552 --ignore-vuln PYSEC-2026-3553 --ignore-vuln PYSEC-2026-3554 --ignore-vuln GHSA-537c-gmf6-5ccf
