@@ -201,6 +201,23 @@ export function bypassBudget(
 
 // Locus-of-control axis: posts showing agency over posts showing helplessness.
 //
+// 0.86 is the recalibration for the TypeSafe-distilled vector (2026-09-17). A
+// threshold never survives a retrain, and this one moved the distribution a long
+// way: the previous vector's probabilities spanned 0.618..0.966, the new one's
+// span 0.178..0.996, so the old 0.88 would have kept 36% of corpus texts where it
+// used to keep 44% — a quietly shorter feed, not a like-for-like swap.
+//
+// 0.86 was chosen to hold the *operating point* fixed and take the quality gain
+// instead. Measured on the same three pools the old number was measured on:
+//
+//              corpus   live candidates   val internal kept   val external kept
+//   old @0.88   43.6%        54.6%              77%                 25%
+//   new @0.86   43.6%        55.1%              84%                 27%
+//
+// Same share of candidates survives, and 7 points more of the internal posts do.
+// See docs/reports/REPORT_typesafe_distill_ab.md for the retrain itself.
+//
+// The previous calibration, kept for the record:
 // 0.88 was recalibrated for the vector retrained in 4a9286e, which shifted the
 // score distribution up: its cosines span roughly -0.22..+0.25, so with scale
 // 6.542 / bias 1.807 nothing scores below ~0.59 and the previous 0.55 rejected
@@ -213,7 +230,7 @@ export function bypassBudget(
 // reranker — raise num_candidates first if you want that operating point.
 const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   scorer: createScorer(locVectorData as VectorData),
-  threshold: 0.88,
+  threshold: 0.86,
   // Locus of control is a claim about agency, and a post has to say something
   // for that claim to be readable at all. Measured against a live 500-candidate
   // pool: 6 words cuts the pool to 396 (23 of the drops had *empty* text, which
