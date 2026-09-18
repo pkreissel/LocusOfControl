@@ -263,11 +263,22 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 // the deadline would never have fired before the isolate was killed -- exactly
 // the silent stall it exists to prevent.
 //
-// Against measured latency, generate runs 1.7-3.0s at num_candidates 1000 and
-// rank ~0.5s. 4s covers the top of the generate range with margin and still
-// leaves ~6s for embed, rank and the write. This is the point past which waiting
-// longer serves the reader worse than serving what we already have.
-const GE_GENERATE_TIMEOUT_MS = 4000;
+// Sized against what generate actually costs in production, which is not what
+// this comment first claimed. "1.7-3.0s at num_candidates 1000" was measured off
+// a handful of calls; a week of feed_logs says the gather stage runs p50 3.5s,
+// p90 5.0s, max 6.2s. So 4s cut through the middle of the working distribution
+// rather than above it, and every call past it was discarded as an empty feed:
+// the failure rate went 3.0% (10/336, all 502s) under the old 8s cap to 11.6%
+// (8/69, all timeouts) in the first eighteen hours under 4s.
+//
+// 6.5s covers the observed maximum. It leaves ~3s for embed, rank and the write,
+// which the measured downstream fits (embed+rank+store p50 ~1.2s, worst ~3.2s),
+// and when it does not, the budget below squeezes those stages into the degraded
+// paths they already have -- cached scores only, the vector's own order -- every
+// one of which still produces a feed. That is the trade: a late feed beats a
+// blank one. An empty pool is no longer blank either; it falls back to the last
+// good list at (4b) below.
+const GE_GENERATE_TIMEOUT_MS = 6500;
 const GE_RANK_TIMEOUT_MS = 6000;
 
 // A generate that fails *early* leaves budget on the table, and the failures that
@@ -463,6 +474,42 @@ async function safeCachePut(cache: Cache, key: string, res: Response): Promise<v
     await cache.put(key, res);
   } catch (e) {
     console.error("[cache] put failed (skipping):", (e as any)?.message);
+  }
+}
+
+// The last public ranked list that was produced successfully, for the staleness
+// fallback at (4b). Anonymous readers have no feed_sessions row to fall back on
+// -- sessions are stored against a DID and the public ones cannot be looked up by
+// one -- so the public equivalent is kept here instead: one entry per feed,
+// written on every successful public response and read only when the pipeline
+// produced nothing.
+//
+// Shaped to match getLatestFeedSession so (4b) can treat the two identically. The
+// stored body is a skeleton, so its URIs are recovered from `feed`, and its age
+// from the timestamp written beside it rather than from the Cache API (whose
+// freshness is what decides that the entry still exists at all, not how old it
+// is). sessionId is empty: the ranked list behind a public body belongs to a
+// session this reader does not own, so the fallback serves page 1 without a
+// cursor rather than handing out one that (2) would reject.
+async function readLastGoodPublic(
+  cache: Cache,
+  key: string,
+): Promise<{ sessionId: string; uris: string[]; createdAt: number } | null> {
+  const res = await safeCacheMatch(cache, key);
+  if (!res || res.status !== 200) return null;
+  try {
+    const body = await res.json() as SkeletonBody;
+    const uris = Array.isArray(body?.feed) ? body.feed.map(f => f.post).filter(Boolean) : [];
+    if (!uris.length) return null;
+    const storedAt = Number(res.headers.get('X-Stored-At'));
+    return {
+      sessionId: '',
+      uris,
+      createdAt: Number.isFinite(storedAt) ? storedAt : 0,
+    };
+  } catch (e) {
+    console.error("[cache] last-good parse failed (treating as miss):", (e as any)?.message);
+    return null;
   }
 }
 
@@ -680,6 +727,18 @@ async function handleRequest(request: Request): Promise<Response> {
       skeletonCacheUrl.search = '';
       skeletonCacheUrl.searchParams.set('key', cacheKey);
       const skeletonCacheKeyStr = skeletonCacheUrl.toString();
+
+      // Key for the last-good public list (see readLastGoodPublic and the write
+      // below). Deliberately keyed by feed alone -- not by cursor, not by page
+      // size. There is exactly one "the last public feed that worked", the stored
+      // body is the whole ranked list and the reader slices it to its own `limit`,
+      // and an entry keyed by the cursor or limit of the request that wrote it
+      // could never be found by the failing request that needs it.
+      const lastGoodCacheUrl = new URL(request.url);
+      lastGoodCacheUrl.pathname = '/_cache/lastgood';
+      lastGoodCacheUrl.search = '';
+      lastGoodCacheUrl.searchParams.set('key', rkey);
+      const lastGoodCacheKeyStr = lastGoodCacheUrl.toString();
 
       const cache = caches.default;
       // Personalized feeds are never cached (see the write path below): every
@@ -1184,6 +1243,72 @@ async function handleRequest(request: Request): Promise<Response> {
       // lets later pages slice further into this exact ordering without
       // regenerating. (Previously the entire list was returned as a single page.)
       const rankedUris = filteredCandidates.map(c => c.uri);
+
+      // (4b) Staleness fallback. Every stage above has a failure path that ends
+      // here with nothing: GE timed out, GE answered with an empty pool, the text
+      // gates dropped everything, the rank returned no order. Each of those was
+      // written as "serve what we have", but what we have at this point is an
+      // empty skeleton -- a 200 that the client renders as a feed which will not
+      // load. That is the worst output this worker produces and the one a reader
+      // actually notices, and it is avoidable: a ranked list from minutes ago is
+      // still a perfectly good feed. Serve that instead of nothing.
+      //
+      // Deliberately wider than the START_REUSE_TTL_MS window at (2b). That one is
+      // an optimisation -- it skips work a fresh request would happily do -- so 90s
+      // keeps it honest. This one is the difference between a feed and a blank
+      // screen, so it reaches back the full session lifetime. The cost is
+      // seen-exclusion: a list this old can repeat posts already scrolled past.
+      // Repeating a post the reader has seen is strictly better than showing none.
+      //
+      // The cursor points into the OLD session, which (2) already knows how to
+      // read, re-check for ownership and freshness, and page. Nothing new has to
+      // be stored for the continuation to work.
+      if (rankedUris.length === 0) {
+        const stale = userDid
+          ? await withDeadline(
+              getLatestFeedSession(userDid), budget.slice(DB_STAGE_TIMEOUT_MS), 'stale-fallback-read')
+              .catch((e: any) => {
+                console.error("[getFeedSkeleton] stale fallback read failed:", errChain(e));
+                return null;
+              })
+          : await readLastGoodPublic(cache, lastGoodCacheKeyStr);
+        if (stale && stale.uris.length > 0 && (Date.now() - stale.createdAt) < SESSION_TTL_MS) {
+          const page = stale.uris.slice(0, limit);
+          const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
+          if (stale.sessionId && limit < stale.uris.length) {
+            body.cursor = encodeCursor(stale.sessionId, limit);
+          }
+          // Named in `errors` rather than hidden by the recovery: a request that
+          // needed this fallback is still a request whose pipeline failed, and the
+          // rate it fires at is the thing worth watching. `pass` stays 0 because
+          // this request ranked nothing -- feedLen reports what the reader got.
+          errs.push('fallback:stale');
+          logFeed({
+            feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'stale',
+            personalized: String(personalized), path: feedPath,
+            candRaw, candShort, cand: candidates.length, pass: 0,
+            off: 0, limit, feedLen: page.length,
+            nextCursor: body.cursor ? 'y' : 'n',
+            gatherMs, ms: Date.now() - t0,
+            tSeen, tPrune, tCand, tEmbed, tRank, tStore,
+            waitUntil: hasWaitUntil() ? 'y' : 'n',
+            errors: errs.join(','),
+          });
+          return new Response(JSON.stringify(body), {
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Cache': 'miss',
+              'X-Page-Path': 'stale',
+              // Personalized or not, this body is one reader's list and is already
+              // served from our own stores; keep the PullZone CDN out of it.
+              'Cache-Control': 'no-store',
+              'X-Feed-Version': 'minilm-prefilter-1',
+              'X-Stale-Age-Ms': String(Date.now() - stale.createdAt),
+            },
+          });
+        }
+      }
+
       let sessionStored = false;
       let sessionId = '';
       if (rankedUris.length > 0) {
@@ -1243,6 +1368,32 @@ async function handleRequest(request: Request): Promise<Response> {
           }
         });
         await safeCachePut(cache, skeletonCacheKeyStr, resToCache);
+
+        // Keep this list as the public fallback for (4b). The whole ranked list,
+        // not this page, so a later failing request can slice it to whatever
+        // `limit` it was asked for. Its TTL is SESSION_TTL_MS, matching the window
+        // the signed-in fallback reaches back over, so both halves of (4b) go
+        // stale at the same age. X-Stored-At carries the age, because a Cache API
+        // hit tells us the entry is still fresh but not how old it is.
+        //
+        // Guarded on a non-empty list and deferred past the response. Non-empty
+        // because an empty fallback is not a fallback, and writing one here would
+        // replace a usable list with a useless one on exactly the bad request that
+        // needs it. Deferred because RESPONSE_RESERVE_MS is sized for one cache
+        // put, and this is the second -- it must not come out of the reader's
+        // latency to buy insurance for a later reader.
+        if (rankedUris.length > 0) {
+          runAfterResponse(safeCachePut(cache, lastGoodCacheKeyStr, new Response(
+            JSON.stringify({ feed: rankedUris.map(uri => ({ post: uri })) } satisfies SkeletonBody),
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'Cache-Control': `s-maxage=${Math.floor(SESSION_TTL_MS / 1000)}`,
+                'X-Stored-At': String(Date.now()),
+              },
+            },
+          )));
+        }
       }
 
       logFeed({
