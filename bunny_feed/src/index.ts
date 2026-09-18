@@ -123,8 +123,81 @@ type Candidate = {
   minilmScore?: number | null;
   /** Paid score for the same post. Null means its Jina chunk failed. */
   jinaScore?: number | null;
+  /**
+   * GE's own score for this candidate, as the generator returned it, captured
+   * before `score` is overwritten with the vector probability for the reranker's
+   * `candidate_score` model. This is the engagement signal the rerank call exists
+   * to apply; keeping it means a failed rerank can still order by it instead of
+   * falling back to the vector order the shortlist was already selected on. Null
+   * when the generator sent no numeric score.
+   */
+  geScore?: number | null;
   [key: string]: any;
 };
+
+// Order a shortlist by GE's own candidate score, for when the rerank does not
+// happen -- no budget for the call, or the call failed.
+//
+// The alternative, and what this replaced, was to leave the list in the order the
+// sort above left it: descending vector probability. That is the order the
+// shortlist was *selected* on, so using it again as the *ordering* means the rank
+// stage contributed nothing at all. Selection and ordering are different jobs, and
+// the reranker existed to do the second one.
+//
+// GE's score is the closest thing to it already in hand: it is the engagement
+// signal the rerank call blends with `candidate_score` anyway, it costs no round
+// trip, and it arrived with the candidates. Selection is untouched -- these are
+// still the top MAX_RERANK_CANDIDATES by vector -- so this reorders posts that have
+// all already cleared the axis, which is exactly the reranker's remit.
+//
+// It is NOT sorted on raw `score`, because those are not one scale. Measured over
+// a live 500-candidate pool, the three generators in this feed's mix occupy
+// disjoint ranges:
+//
+//   popularity     n=167   10.122 .. 13.271   (median 10.738)
+//   network_likes  n=167    1.000 ..  2.000   (median  1.000)
+//   two_tower      n=166    0.871 ..  0.909   (median  0.880)
+//
+// A raw sort therefore puts every popularity candidate above every network_likes
+// candidate above every two_tower one, which orders the feed by which generator
+// happened to emit a post -- arbitrary, and worse than the vector order it is
+// replacing. So each generator's scores are converted to a rank within their own
+// group first, the same trick fuseByRank uses to make the MiniLM and Jina
+// probabilities comparable, and the groups are then interleaved on that. Best in
+// its group scores 1, worst 0, and a generator that contributed a single candidate
+// gets 0.5 rather than a free top slot.
+//
+// Falls back to leaving the order alone when the generator sent no numeric scores
+// at all, since sorting every candidate by the same null would shuffle a list that
+// at least means something. `errs` records which of the two happened.
+function orderByGeneratorScore(cands: Candidate[], errs: string[]): void {
+  if (!cands.some(c => typeof c.geScore === 'number')) {
+    errs.push('ge-rank:fallback-vector');
+    return;
+  }
+
+  const groups = new Map<string, number[]>();
+  cands.forEach((c, i) => {
+    const key = typeof c.generator_name === 'string' ? c.generator_name : '?';
+    const g = groups.get(key);
+    if (g) g.push(i); else groups.set(key, [i]);
+  });
+
+  const pct = new Array<number>(cands.length).fill(0.5);
+  for (const idxs of groups.values()) {
+    if (idxs.length === 1) continue; // stays 0.5: neutral, not top
+    idxs.sort((a, b) => (cands[b].geScore ?? -Infinity) - (cands[a].geScore ?? -Infinity));
+    const last = idxs.length - 1;
+    idxs.forEach((ci, pos) => { pct[ci] = (last - pos) / last; });
+  }
+
+  // Vector probability breaks ties, so candidates that land on the same normalised
+  // rank keep a meaningful order rather than a sort-stable accident.
+  const keyed = cands.map((c, i) => ({ c, p: pct[i] }));
+  keyed.sort((a, b) => (b.p - a.p) || ((b.c.score || 0) - (a.c.score || 0)));
+  keyed.forEach((k, i) => { cands[i] = k.c; });
+  errs.push('ge-rank:fallback-gescore');
+}
 
 // Length gate behind FeedConfig.minWords: is there enough text here to be worth
 // embedding? URLs are stripped first (a bare link says nothing the vector can
@@ -1154,7 +1227,13 @@ async function handleRequest(request: Request): Promise<Response> {
           for (const c of batch as any[]) {
             if (!c?.at_uri || seenUri.has(c.at_uri)) continue;
             seenUri.add(c.at_uri);
-            merged.push({ ...c, uri: c.at_uri, text: c.content || '' });
+            merged.push({
+              ...c,
+              uri: c.at_uri,
+              text: c.content || '',
+              // Before anything downstream overwrites `score`. See Candidate.geScore.
+              geScore: typeof c.score === 'number' ? c.score : null,
+            });
           }
         }
         candRaw = merged.length;
@@ -1358,14 +1437,22 @@ async function handleRequest(request: Request): Promise<Response> {
           // entirely. Also saves a round-trip.
           tRank = 0;
         } else if (filteredCandidates.length > 0 && rankMs < GE_RANK_MIN_MS) {
-          // No budget left to rank in. The vector's own order is already the
-          // fallback whenever the rerank fails, so take it now instead of paying
-          // for a call that would be aborted before it returned.
+          // No budget left to rank in, so don't pay for a call that would be
+          // aborted before it returned -- take the fallback ordering now. Under the
+          // 5s appview deadline this is the common path, not the rare one, which is
+          // why it orders by GE's score rather than leaving the shortlist in
+          // selection order.
           console.error(`[getFeedSkeleton] skipping GE rank: ${rankMs}ms of budget left`);
           errs.push('ge-rank:no-budget');
+          orderByGeneratorScore(filteredCandidates, errs);
           tRank = 0;
         } else if (filteredCandidates.length > 0) {
           const tR_start = Date.now();
+          // Only a rerank that actually produced an order counts. A non-200, an
+          // exception, and a 200 carrying no rankings are all the same outcome for
+          // the reader -- the list was not reordered -- so all three take the
+          // fallback below rather than silently serving selection order.
+          let reranked = false;
           // (4) Rank via Green Earth
           try {
             const rankRes = await fetch('https://api.greenearth.social/rank/predict', {
@@ -1393,12 +1480,17 @@ async function handleRequest(request: Request): Promise<Response> {
                         const idxB = rankedUris.indexOf(b.uri);
                         return (idxA === -1 ? 9999 : idxA) - (idxB === -1 ? 9999 : idxB);
                     });
+                    reranked = true;
+                } else {
+                    errs.push('ge-rank:empty');
                 }
             }
           } catch (e: any) {
               console.error("[getFeedSkeleton] GE rank failed:", e?.message || String(e));
               errs.push(stageErr('ge-rank', e));
           }
+
+          if (!reranked) orderByGeneratorScore(filteredCandidates, errs);
 
           // NOTE: the GE /diversify step was removed. It re-sorts candidates by
           // the generator's popularity `score` and ignores the input order, so
