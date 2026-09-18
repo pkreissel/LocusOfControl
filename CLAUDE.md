@@ -65,6 +65,15 @@ Gemini's. Distilling from a teacher and then validating against the same teacher
 measures distillation fidelity and nothing else. Keep the training teacher and the
 validation labeller distinct, and say which is which in any number you report.
 
+**Every TypeSafe call is billed, so nothing is asked twice.**
+`training/data/typesafe_ledger.jsonl` is the record of every post ever scored —
+one row per post, holding the full answer, shared across every corpus, feed and
+tag. `score_loc_typesafe.py` asks only for what is missing from it and appends
+each answer the moment it arrives, so a killed run keeps what it paid for. It is
+gitignored like the rest of `training/data/`, and rebuildable from the score
+files with `--rebuild-ledger`. Before the ledger existed the same 500 gold posts
+had been bought four times over.
+
 **Judge this axis on AP and P@25, not AUC.** The feed consumes the top of a
 ranking and never sees the tail. The two metrics have already disagreed in sign
 on a real retrain.
