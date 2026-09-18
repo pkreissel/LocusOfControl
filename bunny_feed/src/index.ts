@@ -390,12 +390,43 @@ const PIPELINE_FINISH_MIN_MS = 900;
 // round-trip (~30ms) in the normal case.
 const STALE_READ_FLOOR_MS = 400;
 
-type Budget = { remaining: () => number; slice: (cap: number) => number };
+// The paid embed stage's share of the request. JINA_TIMEOUT_MS (15s) is a
+// transport-level stall guard for a call that has no business taking that long,
+// and it is far too large to slice a 3.8s request against: as a cap it meant
+// "take everything left". Measured, one Jina round is 0.2-2.0s; 1.2s is what this
+// request can afford to give it, and the batching already adapts to the deadline
+// it is handed.
+const JINA_STAGE_TIMEOUT_MS = 1200;
+
+// Held back from the scoring stages for the session write. The write is what
+// produces the cursor, and without a cursor the reader gets one page and cannot
+// scroll -- a worse outcome than a slightly less well-ordered feed, which is what
+// giving this time to the reranker instead would buy. Ranked by what the reader
+// loses: the paid scores first, then the ability to page, then GE's rerank, whose
+// absence already has a defined fallback in the vector's own order.
+const SESSION_WRITE_RESERVE_MS = 450;
+
+type Budget = {
+  remaining: () => number;
+  slice: (cap: number) => number;
+  sliceReserving: (cap: number, reserve: number) => number;
+};
 
 function requestBudget(t0: number): Budget {
   const deadline = t0 + REQUEST_BUDGET_MS - RESPONSE_RESERVE_MS;
   const remaining = () => Math.max(0, deadline - Date.now());
-  return { remaining, slice: (cap: number) => Math.min(cap, remaining()) };
+  const slice = (cap: number) => Math.min(cap, remaining());
+  // slice(), but holding `reserve` back for a stage that runs later. Without this
+  // the stages are strictly greedy -- each takes min(its cap, everything left) --
+  // so an early stage with a large cap silently spends what a later one needs, and
+  // the later one is skipped on a budget the earlier one did not require. That is
+  // not hypothetical: JINA_TIMEOUT_MS is 15s, a transport-level stall guard, so the
+  // embed stage took the entire remainder on every request and the session write
+  // behind it missed its deadline by 400ms. The reader got a feed with no cursor
+  // and could not scroll.
+  const sliceReserving = (cap: number, reserve: number) =>
+    Math.min(cap, Math.max(0, remaining() - reserve));
+  return { remaining, slice, sliceReserving };
 }
 
 // Bound a call that has no AbortSignal of its own -- the DB helpers -- against the
@@ -631,7 +662,7 @@ async function scoreCandidates(
     // (possibly nothing, which is an empty feed) and name it, rather than paying
     // Jina for embeddings that arrive after the request is gone. Deliberately not
     // the rethrow below, even with no hits: nothing is wrong with Jina here.
-    const jinaMs = budget.slice(JINA_TIMEOUT_MS);
+    const jinaMs = budget.sliceReserving(JINA_STAGE_TIMEOUT_MS, SESSION_WRITE_RESERVE_MS);
     if (jinaMs < JINA_MIN_MS) {
       console.error(`[score cache] skipping Jina: ${jinaMs}ms of budget left, serving ${hits} cached score(s)`);
       errs.push('jina:no-budget');
@@ -1318,7 +1349,7 @@ async function handleRequest(request: Request): Promise<Response> {
         
         // Fixed once, so the branch below and the signal it hands the fetch are
         // deciding on the same number.
-        const rankMs = budget.slice(GE_RANK_TIMEOUT_MS);
+        const rankMs = budget.sliceReserving(GE_RANK_TIMEOUT_MS, SESSION_WRITE_RESERVE_MS);
         if (filteredCandidates.length > 0 && feedConfig.rankBy === 'score') {
           // The vector IS the editorial criterion for this feed, and
           // filteredCandidates is already sorted by it. Handing that order to
@@ -1406,7 +1437,11 @@ async function handleRequest(request: Request): Promise<Response> {
         // and a refresh regenerates -- which is already what a failed write does.
         sessionStored = await withDeadline(
           putFeedSession(sessionId, userDid, rankedUris),
-          budget.slice(DB_STAGE_TIMEOUT_MS), 'session-write')
+          // The floor is what SESSION_WRITE_RESERVE_MS was held back for. Every
+          // stage above sliced around it, so it is time this request already
+          // declined to spend elsewhere rather than an overrun.
+          Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), SESSION_WRITE_RESERVE_MS),
+          'session-write')
           .catch((e: any) => {
             console.error("[getFeedSkeleton] session write failed:", errChain(e));
             errs.push(stageErr('session-write', e));
