@@ -238,18 +238,29 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
   // Going to 8 buys little (245 through) and starts cutting real one-liners.
   minWords: 6,
-  // GE's per-request ceiling. Asked for here not to make the feed longer -- the
-  // rank-based prefilter already fills the 100-post cap out of 500 -- but to
-  // improve what the top 150 are chosen from. Doubling the pool roughly doubles
-  // the field the shortlist ranks (500 -> 474 past minWords, 1000 -> 935) and
-  // lifts where the cut lands from p = 0.9016 to p = 0.9244 on the signed-in pool,
-  // 0.8997 -> 0.9270 on the anonymous one: a better 150, not more of them.
+  // Back to 500 from GE's 1000 ceiling, and this is a quality concession made to
+  // buy latency. 1000 bought a better shortlist: it roughly doubled the field the
+  // top 150 are ranked from (500 -> 474 past minWords, 1000 -> 935) and lifted
+  // where the cut lands from p = 0.9016 to p = 0.9244 on the signed-in pool,
+  // 0.8997 -> 0.9270 on the anonymous one. That is a real loss and it is being
+  // taken deliberately.
   //
-  // Costs +0.5-1.4s on the GE call (1.2-1.6s -> 1.7-3.0s measured over three calls
-  // each) and doubles the hydrated payload to ~2.6MB. The paid stage does not grow
-  // -- it is capped at `shortlist` either way -- though a shortlist drawn from
-  // twice the pool churns more, so more distinct posts reach Jina over time.
-  numCandidates: 1000,
+  // What it cost is mostly not the GE call. Measured six interleaved calls each:
+  // 500 -> mean 1.36s / 1.23MB, 1000 -> mean 1.64s / 2.46MB, so the request itself
+  // is only ~270ms dearer. But t_cand ran p50 3.5s / p90 5.0s at 1000 against a
+  // 1.6s call, and that ~1.9s gap is this worker's own: parsing a 2.46MB body,
+  // base64-decoding a MiniLM embedding per candidate, the dedup merge and the text
+  // gates. All of it scales with the pool, and halving the pool halves it.
+  //
+  // That was affordable against a 10s appview deadline. Against the 5s one it is
+  // not -- the gather stage alone was spending the whole budget, and 69% of
+  // signed-in requests finished past the deadline and were discarded unseen. A
+  // shortlist chosen from 935 posts that no reader receives is worth less than one
+  // chosen from 474 that arrives.
+  //
+  // Revisit if the pool ever gets cheaper to fetch -- the ranking argument for
+  // 1000 was sound and is unchanged; only the time available to act on it moved.
+  numCandidates: 500,
   // Ranks every candidate for free over GE's hydrated embeddings and hands the top
   // `shortlist` to Jina. Rank only: there is deliberately no probability floor on
   // this stage.

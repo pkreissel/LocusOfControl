@@ -263,23 +263,24 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 // the deadline would never have fired before the isolate was killed -- exactly
 // the silent stall it exists to prevent.
 //
-// Sized against what generate actually costs in production, which is not what
-// this comment first claimed. "1.7-3.0s at num_candidates 1000" was measured off
-// a handful of calls; a week of feed_logs says the gather stage runs p50 3.5s,
-// p90 5.0s, max 6.2s. So 4s cut through the middle of the working distribution
-// rather than above it, and every call past it was discarded as an empty feed:
-// the failure rate went 3.0% (10/336, all 502s) under the old 8s cap to 11.6%
-// (8/69, all timeouts) in the first eighteen hours under 4s.
+// Sized against the appview's deadline, which is the only one that decides
+// whether a reader sees this feed. See REQUEST_BUDGET_MS: it is 5s, and a
+// response that misses it is discarded whole -- the reader gets
+// UpstreamFailure/"feed unavailable" no matter how good the feed was.
 //
-// 6.5s covers the observed maximum. It leaves ~3s for embed, rank and the write,
-// which the measured downstream fits (embed+rank+store p50 ~1.2s, worst ~3.2s),
-// and when it does not, the budget below squeezes those stages into the degraded
-// paths they already have -- cached scores only, the vector's own order -- every
-// one of which still produces a feed. That is the trade: a late feed beats a
-// blank one. An empty pool is no longer blank either; it falls back to the last
-// good list at (4b) below.
-const GE_GENERATE_TIMEOUT_MS = 6500;
-const GE_RANK_TIMEOUT_MS = 6000;
+// This cap has been 8s, then 4s, then 6.5s, each sized against generate's own
+// measured latency at num_candidates 1000 (p50 3.5s, p90 5.0s, max 6.2s in
+// feed_logs). Every one of those numbers is larger than the budget the whole
+// request now has, which is the real lesson: at a 1000-candidate pool this stage
+// could not be made to fit, so the pool shrank instead (numCandidates 500 in
+// feeds.ts). The GE call itself measures 1.2-1.9s there; the rest of t_cand is
+// this worker decoding the payload, which halves with it. 2.5s covers the call
+// with room for the decode, and the budget takes back anything it cannot pay.
+//
+// Rank drops with it. ~0.5s measured, 1.4s at its worst in feed_logs, and it can
+// no longer be allowed six seconds it has never used and could not spend.
+const GE_GENERATE_TIMEOUT_MS = 2500;
+const GE_RANK_TIMEOUT_MS = 1200;
 
 // A generate that fails *early* leaves budget on the table, and the failures that
 // actually show up here -- a dropped connection, a 502 from a rolling deploy, a
@@ -291,26 +292,26 @@ const GE_RANK_TIMEOUT_MS = 6000;
 // Two conditions gate it, and both are about "early". The failure must be one
 // that can differ next time (a 4xx is the same request being wrong, and repeating
 // it just burns latency), and at least GE_GENERATE_RETRY_MIN_MS of the budget must
-// remain. That floor is 3.0s, the top of the measured generate range: a retry
-// either gets a window a generate has actually been observed to finish in, or it
-// does not run at all -- a retry that is going to be aborted at the deadline only
-// delays the empty pool the reader is already getting. Inside a 4s budget that
-// makes "early" mean "failed within a second", which is what the failures worth
-// retrying look like: a refused connection or an instant 502 lands in tens of
-// milliseconds. A timeout is by construction not early -- it consumed the whole
-// budget -- so it is never retried.
+// remain. That floor is the top of the measured generate range at the pool size we
+// now ask for (1.4-2.2s hydrated at 500 candidates): a retry either gets a window
+// a generate has actually been observed to finish in, or it does not run at all --
+// a retry that is going to be aborted at the deadline only delays the empty pool
+// the reader is already getting. Inside a 2.5s stage that makes "early" mean
+// "failed within ~300ms", which is what the failures worth retrying look like: a
+// refused connection or an instant 502 lands in tens of milliseconds. A timeout is
+// by construction not early -- it consumed the whole budget -- so it is never
+// retried.
 const GE_GENERATE_MAX_ATTEMPTS = 2;
-const GE_GENERATE_RETRY_MIN_MS = 3000;
+const GE_GENERATE_RETRY_MIN_MS = 2200;
 const GE_GENERATE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 // --- One budget for the whole request --------------------------------------
 //
 // The caps above, and JINA_TIMEOUT_MS, are per-call stall guards, each sized off
 // its own call's measured latency. Summed, they bound nothing: the stages run in
-// series inside a request that has 10s, so deadlines that are each individually
-// payable still describe a request the platform kills before any of them fires --
-// the silent stall they exist to prevent, reintroduced by the deadlines
-// themselves.
+// series inside one request, so deadlines that are each individually payable still
+// describe a request that blows its deadline before any of them fires -- the
+// silent stall they exist to prevent, reintroduced by the deadlines themselves.
 //
 // So the caps stay what they are ("longer than this and the call is hung") and
 // the ceiling is enforced once, here: every stage takes min(its cap, what is left
@@ -318,7 +319,38 @@ const GE_GENERATE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]
 // takes the failure path it already has -- empty pool, cached scores only, the
 // vector's own order, no cursor -- and names itself in `errors`, which is the same
 // outcome as aborting at the deadline minus the time spent waiting for it.
-const REQUEST_BUDGET_MS = 10000;
+// 10s was right when it was written, and silently stopped being right. The
+// appview wrapped its getFeedSkeleton fetch in a hardcoded
+// `AbortSignal.timeout(10_000)`, so 10s was exactly the deadline this worker had
+// to beat. On 2026-09-01 that became configurable and the default halved:
+//
+//   -    signal: AbortSignal.any([params.signal, AbortSignal.timeout(10_000)]),
+//   +      AbortSignal.timeout(ctx.cfg.feedGenSkeletonTimeout),   // 5 * SECOND
+//
+// (bluesky-social/atproto cae15d9f, #5473). Nothing here failed, so nothing here
+// noticed. A request that misses the appview's deadline is discarded whole: the
+// reader gets UpstreamFailure / "feed unavailable" while feed_logs records a
+// clean row with a full feed and no errors, because from this side the request
+// succeeded. That is the one failure this table cannot see by design, and it was
+// the majority case -- 165 of 247 fresh-pipeline requests over the week were past
+// 5s, 69% of the signed-in ones, every day between 49% and 88%.
+//
+// So the budget is the appview's deadline minus the trip it does not cover: DNS,
+// TLS and transfer between the appview and this edge, which AbortSignal.timeout
+// starts counting before this worker is even entered and none of which is visible
+// from in here. 700ms for that, which is deliberately more than a round trip
+// should cost: the stages below are deadlined but the work *between* them is not
+// -- decoding the GE payload, the dedup merge, the text gates, the prefilter dot
+// products, serialising the body -- and that unmeasured remainder was 888ms of the
+// 8667ms request that prompted all this. The bail at (3z) is what actually pays
+// for it, by reading the clock after the expensive untimed stretch rather than
+// assuming it was free.
+//
+// Prefer being early and slightly stale to being late and discarded: past the
+// deadline a perfect feed is worth exactly nothing.
+const APPVIEW_SKELETON_TIMEOUT_MS = 5000;
+const APPVIEW_NETWORK_MARGIN_MS = 700;
+const REQUEST_BUDGET_MS = APPVIEW_SKELETON_TIMEOUT_MS - APPVIEW_NETWORK_MARGIN_MS;
 // Held out of the budget for the work after the last stage: serializing the body,
 // the public skeleton cache put, the response. None of that is deadlined, so it
 // has to come out of the budget rather than off the end of it.
@@ -326,22 +358,37 @@ const RESPONSE_RESERVE_MS = 500;
 
 // Floors. Below these a stage cannot finish even at the fastest it has been
 // observed to run, so starting it would spend the reader's remaining time to
-// reach the same failure path, later. Measured: generate 1.7-3.0s, one Jina
-// round 0.7-3.9s, rank ~0.5s.
-const GE_GENERATE_MIN_MS = 1700;
+// reach the same failure path, later. Measured at numCandidates 500: generate
+// 1.4-2.2s, one Jina round 0.7-3.9s, rank ~0.5s.
+const GE_GENERATE_MIN_MS = 1200;
 const JINA_MIN_MS = 700;
 const GE_RANK_MIN_MS = 500;
 
 // Cap on any single blocking DB call. The driver bounds one HTTP attempt
 // (DB_REQUEST_TIMEOUT_MS) but not the retry sequence around it, and these calls
 // take no AbortSignal, so they are bounded at the call site instead. An indexed
-// round-trip measures ~30ms, so 1.5s only fires when the DB is not answering --
+// round-trip measures ~30ms, so 600ms only fires when the DB is not answering --
 // including the cold-replica attach that has been observed to take tens of
-// seconds. Losing that race is the intended outcome under a 10s budget: a cold
-// attach cannot be waited out and still leave time for a feed, so the request
-// continues without exclusion, or without a cursor, instead of being killed
-// mid-wait having logged nothing.
-const DB_STAGE_TIMEOUT_MS = 1500;
+// seconds. Losing that race is the intended outcome, now more than ever: under a
+// 4.5s budget a request makes several of these calls, and 1.5s each was a third of
+// the budget apiece for work that normally costs 30ms. A cold attach cannot be
+// waited out and still leave time for a feed, so the request continues without
+// exclusion, or without a cursor, instead of being killed mid-wait having logged
+// nothing.
+const DB_STAGE_TIMEOUT_MS = 600;
+
+// Below this much budget left after the candidates are in, the scoring stages
+// cannot produce anything the appview will still accept, so the request stops
+// spending and serves the last good list instead. Sized as what the cheapest
+// useful finish costs: the score-cache read, the vector's own order over an
+// already-hydrated pool, and the write. A request that bails here is one the old
+// code would have spent two more seconds on and then had discarded.
+const PIPELINE_FINISH_MIN_MS = 900;
+
+// The stale read is allowed this much even when the budget is gone -- see
+// serveStale. It is the last step before an empty screen, and it is one indexed
+// round-trip (~30ms) in the normal case.
+const STALE_READ_FLOOR_MS = 400;
 
 type Budget = { remaining: () => number; slice: (cap: number) => number };
 
@@ -902,6 +949,79 @@ async function handleRequest(request: Request): Promise<Response> {
       }
       tPrune = Date.now() - tS_start;
 
+      // Serve the most recent good list instead of nothing. Three call sites, one
+      // body: the budget bail after the gather stage, the empty-list case at (4b),
+      // and any future stage that finds itself with nothing worth sending.
+      //
+      // Reaches back SESSION_TTL_MS, deliberately wider than the
+      // START_REUSE_TTL_MS window at (2b). That one is an optimisation -- it skips
+      // work a fresh request would happily redo -- so 90s keeps it honest. This one
+      // is the difference between a feed and no feed, so it reaches back the full
+      // session lifetime. The cost is seen-exclusion: a list this old can repeat
+      // posts already scrolled past, which is strictly better than showing none.
+      //
+      // The cursor points into the OLD session, which (2) already knows how to
+      // read, re-check for ownership and freshness, and page, so nothing new has to
+      // be stored for the continuation to work. The public list carries no session
+      // of this reader's, so it is served as page 1 without a cursor rather than
+      // with one (2) would reject.
+      //
+      // The read gets STALE_READ_FLOOR_MS even when the budget is spent. That is
+      // the one place it is right to spend past the reserve: this is the last
+      // thing standing between the reader and an empty screen, and the reserve
+      // exists for exactly this sort of tail work. Bounded, so it cannot itself
+      // push the response past the appview's deadline.
+      const serveStale = async (
+        reason: string,
+        extra: Record<string, unknown>,
+      ): Promise<Response | null> => {
+        const stale = userDid
+          ? await withDeadline(
+              getLatestFeedSession(userDid),
+              Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), STALE_READ_FLOOR_MS),
+              'stale-fallback-read')
+              .catch((e: any) => {
+                console.error("[getFeedSkeleton] stale fallback read failed:", errChain(e));
+                return null;
+              })
+          : await readLastGoodPublic(cache, lastGoodCacheKeyStr);
+        if (!stale || stale.uris.length === 0) return null;
+        const ageMs = Date.now() - stale.createdAt;
+        if (ageMs >= SESSION_TTL_MS) return null;
+
+        const page = stale.uris.slice(0, limit);
+        const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
+        if (stale.sessionId && limit < stale.uris.length) {
+          body.cursor = encodeCursor(stale.sessionId, limit);
+        }
+        // Named in `errors` rather than hidden by the recovery: a request that
+        // needed this is still a request whose pipeline did not deliver, and the
+        // rate it fires at is the thing worth watching.
+        errs.push(reason);
+        logFeed({
+          feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'stale',
+          personalized: String(personalized), path: feedPath,
+          off: 0, limit, feedLen: page.length,
+          nextCursor: body.cursor ? 'y' : 'n',
+          ms: Date.now() - t0,
+          waitUntil: hasWaitUntil() ? 'y' : 'n',
+          errors: errs.join(','),
+          ...extra,
+        });
+        return new Response(JSON.stringify(body), {
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Cache': 'miss',
+            'X-Page-Path': 'stale',
+            // Personalized or not, this body is one reader's list and is already
+            // served from our own stores; keep the PullZone CDN out of it.
+            'Cache-Control': 'no-store',
+            'X-Feed-Version': 'minilm-prefilter-1',
+            'X-Stale-Age-Ms': String(ageMs),
+          },
+        });
+      };
+
       const tC_start = Date.now();
       let candRaw = 0, candShort = 0;
       let preHydrated = 0, preKept = 0, preFloor = 0, preFellBack = false;
@@ -1029,6 +1149,28 @@ async function handleRequest(request: Request): Promise<Response> {
       tCand = Date.now() - tC_start;
       
       const gatherMs = Date.now() - tG;
+
+      // (3z) Out of time before the paid stages. The candidates are in, but not
+      // early enough for anything downstream to reach the reader: the appview
+      // stops waiting at APPVIEW_SKELETON_TIMEOUT_MS and throws the whole response
+      // away, so a feed finished after that point is indistinguishable from no
+      // feed at all. The old code did not know that and spent the time anyway --
+      // 165 of 247 fresh requests over a week were built, logged as clean, and
+      // discarded in flight.
+      //
+      // So stop here and serve the last good list, which is ready now. The trade
+      // is a feed up to SESSION_TTL_MS stale against one the reader never sees,
+      // and it is only reached when the gather already overran; a request with
+      // budget left still generates fresh, exactly as before.
+      if (budget.remaining() < PIPELINE_FINISH_MIN_MS) {
+        console.error(`[getFeedSkeleton] out of budget after gather: ${budget.remaining()}ms left, serving last good list`);
+        const staleRes = await serveStale('budget:gather-overran', {
+          candRaw, candShort, cand: candidates.length, pass: 0,
+          gatherMs, tSeen, tPrune, tCand,
+        });
+        if (staleRes) return staleRes;
+      }
+
       const filteredCandidates: Candidate[] = [];
 
       if (candidates.length > 0) {
@@ -1244,69 +1386,16 @@ async function handleRequest(request: Request): Promise<Response> {
       // regenerating. (Previously the entire list was returned as a single page.)
       const rankedUris = filteredCandidates.map(c => c.uri);
 
-      // (4b) Staleness fallback. Every stage above has a failure path that ends
-      // here with nothing: GE timed out, GE answered with an empty pool, the text
-      // gates dropped everything, the rank returned no order. Each of those was
-      // written as "serve what we have", but what we have at this point is an
-      // empty skeleton -- a 200 that the client renders as a feed which will not
-      // load. That is the worst output this worker produces and the one a reader
-      // actually notices, and it is avoidable: a ranked list from minutes ago is
-      // still a perfectly good feed. Serve that instead of nothing.
-      //
-      // Deliberately wider than the START_REUSE_TTL_MS window at (2b). That one is
-      // an optimisation -- it skips work a fresh request would happily do -- so 90s
-      // keeps it honest. This one is the difference between a feed and a blank
-      // screen, so it reaches back the full session lifetime. The cost is
-      // seen-exclusion: a list this old can repeat posts already scrolled past.
-      // Repeating a post the reader has seen is strictly better than showing none.
-      //
-      // The cursor points into the OLD session, which (2) already knows how to
-      // read, re-check for ownership and freshness, and page. Nothing new has to
-      // be stored for the continuation to work.
+      // (4b) Nothing to serve. Every stage above has a failure path that ends here
+      // with an empty list: GE timed out, GE answered with an empty pool, the text
+      // gates dropped everything, the rank returned no order. Each was written as
+      // "serve what we have", and what we have at this point is an empty skeleton.
       if (rankedUris.length === 0) {
-        const stale = userDid
-          ? await withDeadline(
-              getLatestFeedSession(userDid), budget.slice(DB_STAGE_TIMEOUT_MS), 'stale-fallback-read')
-              .catch((e: any) => {
-                console.error("[getFeedSkeleton] stale fallback read failed:", errChain(e));
-                return null;
-              })
-          : await readLastGoodPublic(cache, lastGoodCacheKeyStr);
-        if (stale && stale.uris.length > 0 && (Date.now() - stale.createdAt) < SESSION_TTL_MS) {
-          const page = stale.uris.slice(0, limit);
-          const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
-          if (stale.sessionId && limit < stale.uris.length) {
-            body.cursor = encodeCursor(stale.sessionId, limit);
-          }
-          // Named in `errors` rather than hidden by the recovery: a request that
-          // needed this fallback is still a request whose pipeline failed, and the
-          // rate it fires at is the thing worth watching. `pass` stays 0 because
-          // this request ranked nothing -- feedLen reports what the reader got.
-          errs.push('fallback:stale');
-          logFeed({
-            feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'stale',
-            personalized: String(personalized), path: feedPath,
-            candRaw, candShort, cand: candidates.length, pass: 0,
-            off: 0, limit, feedLen: page.length,
-            nextCursor: body.cursor ? 'y' : 'n',
-            gatherMs, ms: Date.now() - t0,
-            tSeen, tPrune, tCand, tEmbed, tRank, tStore,
-            waitUntil: hasWaitUntil() ? 'y' : 'n',
-            errors: errs.join(','),
-          });
-          return new Response(JSON.stringify(body), {
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Cache': 'miss',
-              'X-Page-Path': 'stale',
-              // Personalized or not, this body is one reader's list and is already
-              // served from our own stores; keep the PullZone CDN out of it.
-              'Cache-Control': 'no-store',
-              'X-Feed-Version': 'minilm-prefilter-1',
-              'X-Stale-Age-Ms': String(Date.now() - stale.createdAt),
-            },
-          });
-        }
+        const staleRes = await serveStale('fallback:empty', {
+          candRaw, candShort, cand: candidates.length, pass: 0,
+          gatherMs, tSeen, tPrune, tCand, tEmbed, tRank, tStore,
+        });
+        if (staleRes) return staleRes;
       }
 
       let sessionStored = false;
