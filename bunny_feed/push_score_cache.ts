@@ -44,6 +44,16 @@ type CachedScore = {
   vector_prob: number;
   vector_version: string;
   embedding_model?: string;
+  /**
+   * What computed `vector_prob`. Absent means the vector itself did
+   * (score_loc_vector.py) — the ordinary case, and what the cache is documented
+   * to hold. `typesafe_calibrated` means a teacher judgement quantile-matched
+   * onto this vector's probability scale (calibrate_typesafe_to_vector.py): the
+   * scale is the vector's, so the feed's threshold still means what it means,
+   * but the ORDER is the teacher's and no column in post_scores records that.
+   * Printed on every run because this is the only place it is ever visible.
+   */
+  score_source?: string;
 };
 
 function readCache(file: string): CachedScore[] {
@@ -73,6 +83,18 @@ async function main() {
   const rows = readCache(file);
   console.log(`${rows.length} cached scores in ${path.basename(file)}`);
   console.log(`target cache version: ${version}`);
+
+  const bySource = new Map<string, number>();
+  for (const r of rows) {
+    const src = r.score_source ?? 'vector';
+    bySource.set(src, (bySource.get(src) ?? 0) + 1);
+  }
+  for (const [src, n] of bySource) {
+    console.log(src === 'vector'
+      ? `score source: ${src} (${n}) — what the worker would have computed itself`
+      : `score source: ${src} (${n}) — NOT the vector's own number. The feed will ` +
+        `rank these posts by that source until the rows are pruned or overwritten.`);
+  }
 
   // A row scored by a different vector cannot be filed under this version: the
   // fingerprint in the cache is exactly what the worker's would be, so a

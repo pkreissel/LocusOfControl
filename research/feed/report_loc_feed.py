@@ -9,9 +9,12 @@ this step is free and re-runnable as the caches fill:
   --reranker  the fine-tuned jina-reranker-v3 score (score_loc_reranker.py),
               read from its `rr_band` column, which is the same axis by isotonic
               calibration against the gold labels.
-  --teacher   the teacher LLM's graded loc_score (annotate_lmstudio_soft_labels
-              .py, LOC_PROMPT_VERSION=v4) — optional, and the only non-circular
-              judge here, since both students were distilled from it.
+  --teacher   the teacher's graded score — optional, and the only non-circular
+              judge here, since both students were distilled from it. Two schemas
+              are read: TypeSafe rows (score_loc_typesafe.py, the current teacher)
+              and the superseded local LLM's (annotate_lmstudio_soft_labels.py,
+              LOC_PROMPT_VERSION=v4). Which one produced a number belongs in any
+              report of it.
 
 With a teacher column present, each student is scored against it (rank
 correlation, internal-detection AUC, precision@k). Without one, the students can
@@ -30,9 +33,15 @@ import csv
 import json
 import os
 
+import sys
+
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import average_precision_score, ndcg_score, roc_auc_score
+
+# train_internal_vector lives in training/, which is not this script's package.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "..", "training"))
 
 os.environ.setdefault("LOC_PROMPT_VERSION", "v4")
 INTERNAL_CUT = 5.5  # the trainer's split on [0,9]: internal >= 6
@@ -147,6 +156,9 @@ def main():
     ap.add_argument("--reranker", default="")
     ap.add_argument("--teacher", default="")
     ap.add_argument("--tag", default=os.environ.get("TAG", "feed"))
+    ap.add_argument("--out-dir", default="",
+                    help="where the csv/json/md land; defaults beside --posts, "
+                         "which is research/data/feed/ for every real run")
     ap.add_argument("--threshold", type=float,
                     default=float(os.environ.get("LOC_FEED_THRESHOLD", "0.88")),
                     help="deployed probability gate for this feed (feeds.ts)")
@@ -168,7 +180,10 @@ def main():
     temperature = meta.get("temperature", 1.0)
     vcal = vector_calibration(vfile)
     rcal = reranker_calibration() if reranker else None
-    if teacher:
+    # Only the local-LLM schema needs the trainer's accessors; a TypeSafe file is
+    # read directly below, so a run with one does not depend on training/ at all.
+    T = None
+    if teacher and any("ts_class" not in r for r in teacher.values()):
         import train_internal_vector as T
 
     rows = []
@@ -196,7 +211,24 @@ def main():
             row["rr_logit"] = float(rr["rr_logit"])
             if rcal is not None:
                 row["rr_band"] = rcal(row["rr_logit"])
-        if t:
+        if t and "ts_class" in t:
+            # TypeSafe carries its own schema (score_loc_typesafe.py), mapped here
+            # onto the same 0-9 axis rather than round-tripped through the training
+            # adapter. ts_score is a mean over the five levels of
+            # ts_questions.LOC_LEVELS, and those are v4's 0-9 bands taken in pairs,
+            # so *2 recovers the band and +0.5 lands mid-band, not on its floor.
+            p_int = float(t["ts_class_probs"].get("internal", 0.0))
+            row["teacher_score"] = 2.0 * float(t["ts_score"]) + 0.5
+            row["teacher_label"] = t["ts_class"]
+            # The band geometry build_typesafe_teacher.py hands the trainer:
+            # external floored, neutral at the neutral point, internal graded by
+            # P(internal) across the 6-9 band. Kept identical on purpose — a report
+            # that scored the teacher differently from the trainer would be
+            # measuring the adapter.
+            row["teacher_band"] = (6.0 + 3.0 * p_int if t["ts_class"] == "internal"
+                                   else 0.0 if t["ts_class"] == "external" else 2.0)
+            row["teacher_level"] = None
+        elif t:
             s = T.get_expected_score(t, temperature)
             row["teacher_score"] = float(s if s is not None else t.get("loc_score"))
             row["teacher_band"] = float(T.get_target_score(t, temperature))
@@ -300,13 +332,16 @@ def main():
             r["rank_vector"], r["rank_reranker"] = int(ra[i]) + 1, int(rb[i]) + 1
             r["rank_gap"] = int(rb[i]) - int(ra[i])
 
-    csv_path = f"loc_scores_{args.tag}.csv"
+    out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.posts))
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"loc_scores_{args.tag}.csv")
     cols = [c for c in rows[0] if c != "text"] + ["text"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
-    with open(f"REPORT_loc_feed_{args.tag}.json", "w") as f:
+    json_path = os.path.join(out_dir, f"REPORT_loc_feed_{args.tag}.json")
+    with open(json_path, "w") as f:
         json.dump(report, f, indent=2)
 
     # --- markdown ---------------------------------------------------------
@@ -332,7 +367,13 @@ def main():
                   "scale of its own) plus `rr_band`, projected onto the same band axis by the "
                   "same least-squares fit on the same gold rows")
     if report.get("teacher"):
-        md.append(f"- teacher: graded loc_score at label temperature {temperature}")
+        if any("ts_class" in r for r in teacher.values()):
+            md.append(f"- teacher: TypeSafe System One (`{os.environ.get('TYPESAFE_MODEL', 'jev-latest')}`), "
+                      "`ts_score` mapped onto the 0-9 axis (2*level + 0.5) and `ts_class` as the label. "
+                      "This is the teacher the deployed vector was distilled from, so read the numbers "
+                      "below as distillation fidelity, not as independent accuracy")
+        else:
+            md.append(f"- teacher: local v4 LLM, graded loc_score at label temperature {temperature}")
     md += ["\n## Distributions\n",
            "Raw model outputs first — those are what every ranking number here is computed "
            "on — then the same scores on the shared band axis.\n",
@@ -377,10 +418,10 @@ def main():
         md.append(table(sorted(rows, key=lambda r: -r["rr_logit"]), 15,
                         "Top 15 by reranker score", cols_))
 
-    md_path = f"REPORT_loc_feed_{args.tag}.md"
+    md_path = os.path.join(out_dir, f"REPORT_loc_feed_{args.tag}.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(md))
-    print(f"\nWrote {csv_path}, REPORT_loc_feed_{args.tag}.json, {md_path}")
+    print(f"\nWrote {csv_path}, {json_path}, {md_path}")
     if report.get("students"):
         s = report["students"]
         print(f"  vector vs reranker: spearman {s['spearman']:.3f}, "
