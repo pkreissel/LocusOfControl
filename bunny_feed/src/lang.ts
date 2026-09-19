@@ -103,3 +103,61 @@ export function looksGerman(text: string | null | undefined): boolean {
   const density = umlauts / Math.max(prose.length, 1);
   return deRatio >= MIN_DE_RATIO_WITH_UMLAUTS && density > MIN_UMLAUT_DENSITY;
 }
+
+// The reader's content languages, as their client sends them.
+//
+// The Bluesky app puts its Settings -> Languages -> Content Languages list in
+// `Accept-Language` on getFeed (social-app src/lib/api/feed/custom.ts), and the
+// appview copies that header onto the getFeedSkeleton call it makes to us
+// (atproto packages/bsky/src/api/app/bsky/feed/getFeed.ts). So this is the
+// reader's own filter, arriving one hop late but intact.
+//
+// It is worth reading because the client ENFORCES that list on every custom feed
+// (FeedTuner.preferredLangOnly in social-app src/lib/api/feed-manip.ts): a post
+// outside it is dropped from the page before the reader ever sees it. A feed that
+// ignores the header ranks posts that are discarded on arrival — measured here on
+// 2026-09-19, a German-only reader was served 150 posts and shown 19.
+//
+// Parses both shapes seen in the wild: the app's bare comma list ("de,en") and
+// the weighted browser form ("de-DE,de;q=0.9,en;q=0.8"). Region subtags are
+// dropped because the client matches on the 2-letter code and so must we.
+export function readerLangs(header: string | null | undefined): string[] {
+  const raw = header;
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const code = part.split(';')[0].trim().toLowerCase().split('-')[0];
+    if (code && code !== '*' && !out.includes(code)) out.push(code);
+  }
+  return out;
+}
+
+// Is this a reader whose client will hide the English majority of this feed?
+//
+// Deliberately narrow, and asymmetric with the language list above. German is the
+// only language this worker can detect (lang.ts, and see the note there on why it
+// is German-only), so German is the only preference it can act on: a French-only
+// reader is no better served by German posts than by English ones, and gets
+// today's behaviour rather than a guess. A reader who lists English alongside
+// German sees the whole feed already and is left alone.
+export function prefersGermanOnly(langs: string[]): boolean {
+  return langs.includes('de') && !langs.includes('en');
+}
+
+// Move the posts this reader's client will actually display to the front, keeping
+// the order the ranker chose within each group.
+//
+// Partition rather than filter, because the client's own filter has an escape
+// hatch: a page with no post in the reader's languages is shown in full rather
+// than shown empty (feed-manip.ts, "if the language filter cleared out the entire
+// page, return the original set"). So an English tail behind the German is not
+// waste — it is what the reader pages into once the German runs out, and dropping
+// it would leave them with a short feed instead of a long one.
+export function germanFirst<T extends { text: string }>(list: T[]): void {
+  const first: T[] = [], rest: T[] = [];
+  for (const c of list) (looksGerman(c.text) ? first : rest).push(c);
+  if (!first.length || !rest.length) return;
+  list.length = 0;
+  for (const c of first) list.push(c);
+  for (const c of rest) list.push(c);
+}

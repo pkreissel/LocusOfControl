@@ -3,6 +3,7 @@ import { getEmbeddingsBatched, EMBEDDING_MODEL, JINA_TIMEOUT_MS } from './jina';
 import { decodeEmbedding } from './minilm';
 import { fuseByRank } from './fuse';
 import { resolveFeed, ALL_SCORERS, bypassBudget, type FeedConfig } from './feeds';
+import { readerLangs, prefersGermanOnly, germanFirst } from './lang';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions, recordFeedLog, pruneOldFeedLogs, type FeedLogRow } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 import { siteResponse } from './site';
@@ -871,7 +872,13 @@ async function handleRequest(request: Request): Promise<Response> {
       // `limit` is part of the key: the cached (public) body is already sliced to
       // a page size, so a client asking for a different limit must not be served
       // another's slice.
-      const cacheKey = `${rkey}:${userDid || 'public'}:${startCursor || 'START'}:l${limit}`;
+      // What this reader's client will show of whatever we return (see
+      // readerLangs). Part of the cache key, not just the ranking: the
+      // German-first list built below is the wrong feed for an English reader,
+      // and the public cache is shared across readers.
+      const rLangs = readerLangs(request.headers.get('accept-language'));
+      const deReader = prefersGermanOnly(rLangs);
+      const cacheKey = `${rkey}:${userDid || 'public'}:${startCursor || 'START'}:l${limit}:${deReader ? 'de' : 'any'}`;
 
       const skeletonCacheUrl = new URL(request.url);
       skeletonCacheUrl.pathname = '/_cache/skeleton';
@@ -1334,10 +1341,6 @@ async function handleRequest(request: Request): Promise<Response> {
             const routed = candidates.map((c, i) => ({
               c, p: mini[i], bypass: bypassFn ? bypassFn(c.text) : false,
             }));
-            const kept = routed
-              .filter(x => !x.bypass && x.p !== null)
-              .sort((a, b) => (b.p as number) - (a.p as number))
-              .slice(0, pf.shortlist);
             // Ordered by the same free score the group was routed around — which
             // is not the contradiction it looks like. What the measurement kills
             // is comparing a German score against an English one: on a shared
@@ -1352,9 +1355,24 @@ async function handleRequest(request: Request): Promise<Response> {
             const detour = routed.filter(x => x.bypass)
               .sort((a, b) => (b.p ?? -Infinity) - (a.p ?? -Infinity));
             // Share-matched against the rest of the pool; see bypassBudget().
-            const taken = detour.slice(0, bypassBudget(
-              pf.shortlist, detour.length, routed.length - detour.length,
-              pf.bypassFloor ?? bypassMax, bypassMax));
+            //
+            // Except for a reader whose client hides English (deReader). Sharing
+            // the paid budget between the two groups is the right policy when both
+            // groups can reach the reader; when only one can, it buys scores for
+            // posts that will be dropped on arrival and rations the ones that
+            // won't. So that reader's budget goes to the German group first and
+            // the English shortlist keeps the remainder — the same number of paid
+            // candidates, the same Jina bill, spent where it can be seen.
+            const paidBudget = pf.shortlist + bypassMax;
+            const taken = detour.slice(0, deReader
+              ? Math.min(paidBudget, detour.length)
+              : bypassBudget(
+                  pf.shortlist, detour.length, routed.length - detour.length,
+                  pf.bypassFloor ?? bypassMax, bypassMax));
+            const kept = routed
+              .filter(x => !x.bypass && x.p !== null)
+              .sort((a, b) => (b.p as number) - (a.p as number))
+              .slice(0, deReader ? Math.max(0, paidBudget - taken.length) : pf.shortlist);
             preBypass = taken.length;
             preBypassDropped = detour.length - taken.length;
             paidPool = [...kept.map(x => x.c), ...taken.map(x => x.c)];
@@ -1420,6 +1438,10 @@ async function handleRequest(request: Request): Promise<Response> {
           fuseByRank(filteredCandidates);
         }
         filteredCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
+        // Before the cut, not after: MAX_RERANK_CANDIDATES is the whole length of
+        // the feed, so a German post that falls past it is one this reader can
+        // never be shown, however well it scored.
+        if (deReader) germanFirst(filteredCandidates);
         if (filteredCandidates.length > MAX_RERANK_CANDIDATES) {
           filteredCandidates.length = MAX_RERANK_CANDIDATES;
         }
@@ -1502,7 +1524,16 @@ async function handleRequest(request: Request): Promise<Response> {
         }
       }
 
+      // The rerank (or the fallback ordering) has just sorted on engagement and
+      // score, which threads the English back through the list. Re-apply the
+      // partition last so the frozen list — and therefore page 1, which is the
+      // only page most readers see — leads with what this reader can be shown.
+      // Stable, so the order the ranker chose survives inside each group. Above
+      // tStore, which times the session write and should not absorb this.
+      if (deReader) germanFirst(filteredCandidates);
+
       const tSt_start = Date.now();
+
       // The full ranked list for this scroll session. Page 1 freezes it in a
       // feed_sessions row and serves only the first `limit` posts; the cursor
       // lets later pages slice further into this exact ordering without
@@ -1614,6 +1645,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       logFeed({
         feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'fresh',
+        rlang: rLangs.join(',') || 'none', deFirst: deReader ? 'y' : 'n',
         candRaw, candShort, cand: candidates.length, pass: rankedUris.length,
         off: 0, limit, feedLen: feed.length,
         nextCursor: body.cursor ? 'y' : 'n',
@@ -1642,6 +1674,9 @@ async function handleRequest(request: Request): Promise<Response> {
           // X-Ranked-Count is the full frozen list length; X-Exclude-Count reports
           // how many seen-post URIs were sent to GE as exclude_uris this request.
           'X-Feed-Version': 'minilm-prefilter-1',
+          // What the reader's client told us it will display, and whether that
+          // moved their language to the front of the list.
+          'X-Reader-Lang': `${rLangs.join(',') || 'none'}${deReader ? ' de-first' : ''}`,
           'X-Ranked-Count': String(rankedUris.length),
           'X-Exclude-Count': String(excludeUris.length),
           // Score-cache diagnostics: hits/misses tell you whether the cache is warming
