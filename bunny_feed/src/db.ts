@@ -297,7 +297,9 @@ export async function pruneOldScores(cutoffTs: number): Promise<void> {
 // Store the ranked URI list for a session. Returns true only if the write
 // landed, so the caller emits a continuation cursor only when the list is
 // actually retrievable. Best-effort: never throws.
-export async function putFeedSession(id: string, did: string | null, uris: string[]): Promise<boolean> {
+export async function putFeedSession(
+  id: string, did: string | null, uris: string[], langMode: 'de' | 'any',
+): Promise<boolean> {
   try {
     const db = getDbClient();
     await db.insert(feedSessions).values({
@@ -305,6 +307,7 @@ export async function putFeedSession(id: string, did: string | null, uris: strin
       did,
       uris: JSON.stringify(uris),
       createdAt: Date.now(),
+      langMode,
     });
     return true;
   } catch (e: any) {
@@ -341,15 +344,16 @@ export async function getFeedSession(
 // Scoped to the owning DID and ordered by recency; the caller enforces the reuse
 // freshness window. Backed by the (did, created_at) index. Returns null on miss
 // or parse failure so the caller falls back to a fresh generation.
+// The reader's most recent list built for `langMode` (see feedSessions.langMode).
 export async function getLatestFeedSession(
-  did: string,
+  did: string, langMode: 'de' | 'any',
 ): Promise<{ sessionId: string; uris: string[]; createdAt: number } | null> {
   if (!did) return null;
   const db = getDbClient();
   const rows = await db
     .select({ id: feedSessions.id, uris: feedSessions.uris, createdAt: feedSessions.createdAt })
     .from(feedSessions)
-    .where(eq(feedSessions.did, did))
+    .where(and(eq(feedSessions.did, did), eq(feedSessions.langMode, langMode)))
     .orderBy(desc(feedSessions.createdAt))
     .limit(1);
   const row = (rows as { id: string; uris: string; createdAt: number }[])[0];

@@ -1,0 +1,1 @@
+ALTER TABLE `feed_sessions` ADD `lang_mode` text;

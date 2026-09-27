@@ -77,6 +77,12 @@ export const feedSessions = sqliteTable('feed_sessions', {
   did: text('did'),                            // owner DID (null = public); scopes reads + observability
   uris: text('uris').notNull(),                // JSON array of ranked at-uris (the frozen list)
   createdAt: integer('created_at').notNull(),  // unix ms, for TTL freshness check + prune
+  // 'de' when the list was built German-first for a reader whose client hides
+  // everything else, 'any' otherwise. The page-1 reuse and the stale fallback
+  // only serve a list built for the same mode: an English-first list re-served to
+  // a German-only reader is filtered by their app down to a post or two. Null on
+  // rows written before this column, which are therefore never reused.
+  langMode: text('lang_mode'),
 }, (t) => [
   // Serves the opportunistic prune (WHERE created_at < cutoff). created_at is
   // monotonic, so inserts append to the index edge.

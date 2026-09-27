@@ -778,6 +778,9 @@ async function handleRequest(request: Request): Promise<Response> {
       // readerLangs): a German-only reader gets a German-first list.
       const rLangs = readerLangs(request.headers.get('accept-language'));
       const deReader = prefersGermanOnly(rLangs);
+      // Stored with every frozen list, so a list is only ever re-served to a
+      // request that would have built it the same way (see feedSessions.langMode).
+      const langMode: 'de' | 'any' = deReader ? 'de' : 'any';
 
       // (1) Signed-in readers only. Everything below is built around a reader:
       // candidates come from who they follow, seen posts are excluded, and the
@@ -863,7 +866,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       if (!startCursor) {
         const latest = await withDeadline(
-          getLatestFeedSession(userDid), budget.slice(DB_STAGE_TIMEOUT_MS), 'latest-session-read')
+          getLatestFeedSession(userDid, langMode), budget.slice(DB_STAGE_TIMEOUT_MS), 'latest-session-read')
           .catch((e: any) => { console.error("[getFeedSkeleton] latest-session read failed:", errChain(e)); return null; });
         if (latest && latest.uris.length > 0 && (Date.now() - latest.createdAt) < START_REUSE_TTL_MS) {
           const page = latest.uris.slice(0, limit);
@@ -967,7 +970,7 @@ async function handleRequest(request: Request): Promise<Response> {
         extra: Record<string, unknown>,
       ): Promise<Response | null> => {
         const stale = await withDeadline(
-          getLatestFeedSession(userDid),
+          getLatestFeedSession(userDid, langMode),
           Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), STALE_READ_FLOOR_MS),
           'stale-fallback-read')
           .catch((e: any) => {
@@ -1412,7 +1415,7 @@ async function handleRequest(request: Request): Promise<Response> {
       if (rankedUris.length > 0) {
         sessionId = crypto.randomUUID();
         runAfterResponse(
-          putFeedSession(sessionId, userDid, rankedUris)
+          putFeedSession(sessionId, userDid, rankedUris, langMode)
             .then(ok => { if (!ok) console.error("[getFeedSkeleton] session write reported failure"); })
             .catch((e: any) => console.error("[getFeedSkeleton] session write failed:", errChain(e)))
         );

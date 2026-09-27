@@ -50,6 +50,13 @@
       "when": 1790516591417,
       "tag": "0006_typesafe_answers",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1790519447834,
+      "tag": "0007_feed_sessions_lang_mode",
+      "breakpoints": true
     }
   ]
 }
