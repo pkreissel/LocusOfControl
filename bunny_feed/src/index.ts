@@ -1,12 +1,14 @@
 import { jwtDecode } from 'jwt-decode';
-import { getEmbeddingsBatched, EMBEDDING_MODEL, JINA_TIMEOUT_MS } from './jina';
+import { getEmbeddingsBatched } from './jina';
+import { hasEnoughText } from './text';
 import { decodeEmbedding } from './minilm';
 import { fuseByRank } from './fuse';
-import { resolveFeed, ALL_SCORERS, bypassBudget, type FeedConfig } from './feeds';
+import { resolveFeed, ALL_SCORERS, bypassBudget, scoreCacheVersion, type FeedConfig } from './feeds';
 import { readerLangs, prefersGermanOnly, germanFirst } from './lang';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions, recordFeedLog, pruneOldFeedLogs, type FeedLogRow } from './db';
 import * as BunnySDK from "@bunny.net/edgescript-sdk";
 import { siteResponse } from './site';
+import { runPrescore, PrescoreConfigError } from './prescore';
 
 console.log("Bunny Edge Script module initialized");
 
@@ -28,33 +30,18 @@ function errChain(e: any): string {
 // nothing after a retrain moved the distribution out from under it. See the
 // calibration notes on each FeedConfig.
 
-// Maximum number of candidates to send to the final GE reranker (rank/predict).
-//
-// This is also the entire length of the feed, which is easy to miss from the
-// name: the list this truncates becomes `rankedUris`, which is frozen into the
-// feed_sessions row that every cursor page slices from. So a reader scrolls
-// exactly this many posts and then gets no cursor, i.e. end-of-feed.
+// The entire length of the feed. The list this truncates becomes `rankedUris`,
+// which is frozen into the feed_sessions row that every cursor page slices from,
+// so a reader scrolls exactly this many posts and then gets no cursor, i.e.
+// end-of-feed. (It used to be named for the GE reranker it also capped; that
+// call is gone, see (4).)
 //
 // At 100 that cap was throwing away work already paid for. The rank-based
 // prefilter hands the paid stage ~150 shortlisted candidates plus the bypassed
 // German ones (measured live: preKept 162 anonymous, 250-300 signed-in), and
 // non-bypassed candidates deliberately skip the `threshold` gate, so 200-250
 // survive to be sorted here and 100-150 of them were dropped on the floor.
-//
-// 150 measured against GE's ranker on a live 1000-candidate pool, best of two
-// calls each, payload including the hydrated embeddings each candidate carries:
-//
-//   n=100  286KB  0.90s      n=200  572KB  1.06s
-//   n=150  424KB  0.77s      n=250  716KB  1.19s
-//
-// Flat well past 150 — the extra 138KB costs nothing measurable — so the ceiling
-// here is the shortlist, not the reranker. What the rank stage actually gets is
-// whatever `budget.slice(GE_RANK_TIMEOUT_MS)` leaves it, and a second of upload
-// is not what decides that; if the budget is gone the stage is skipped and these
-// 150 are served in the vector's own order. Note GE returns slightly fewer
-// rankings than it is given (146 of 150, 99 of 100); the sort below leaves those
-// in place at the end rather than dropping them, so the feed is still this long.
-const MAX_RERANK_CANDIDATES = 150;
+const MAX_FEED_LENGTH = 150;
 
 // Minimum share of candidates that must carry a hydrated embedding before the free
 // prefilter is trusted with the pool. Measured coverage after the text gates was
@@ -64,12 +51,6 @@ const MAX_RERANK_CANDIDATES = 150;
 // of the pool.
 const MIN_HYDRATION_COVERAGE = 0.8;
 
-// Weight of the Jina vector-similarity signal in GE's reranker, relative to the
-// two_tower model (fixed at 1.0). We stash each surviving candidate's similarity
-// probability in its `score` field and enable GE's `candidate_score` model, so
-// the ranker itself blends "learned relevance" with "semantic similarity" (and
-// handles the scale normalization) instead of us fusing scores at the edge.
-const RANK_SIM_WEIGHT = 2.5;
 declare const process: any;
 declare const Bunny: any;
 
@@ -96,6 +77,20 @@ function runAfterResponse(promise: Promise<unknown>): void {
 // the live deployment, rather than inferring it from missing rows days later.
 function hasWaitUntil(): boolean {
   return typeof Bunny !== 'undefined' && typeof Bunny.v1?.waitUntil === 'function';
+}
+
+// The reader's DID, from the ATProto service JWT the appview sends. Only decoded,
+// not verified -- the same trust the feed has always extended. Null when the
+// request carries no token (a logged-out reader).
+function didFromAuth(request: Request): string | null {
+  const auth = request.headers.get('Authorization');
+  if (!auth || !auth.startsWith('Bearer ')) return null;
+  try {
+    const decoded: any = jwtDecode(auth.substring(7));
+    return typeof decoded?.iss === 'string' ? decoded.iss : null;
+  } catch {
+    return null;
+  }
 }
 
 function getEnv(key: string): string | undefined {
@@ -126,30 +121,51 @@ type Candidate = {
   jinaScore?: number | null;
   /**
    * GE's own score for this candidate, as the generator returned it, captured
-   * before `score` is overwritten with the vector probability for the reranker's
-   * `candidate_score` model. This is the engagement signal the rerank call exists
-   * to apply; keeping it means a failed rerank can still order by it instead of
-   * falling back to the vector order the shortlist was already selected on. Null
+   * before `score` is overwritten with the vector probability. This is the
+   * engagement signal the final order is built from (orderByGeneratorScore). Null
    * when the generator sent no numeric score.
    */
   geScore?: number | null;
   [key: string]: any;
 };
 
-// Order a shortlist by GE's own candidate score, for when the rerank does not
-// happen -- no budget for the call, or the call failed.
+// Each candidate's GE score as a rank within its own generator: best 1, worst 0,
+// and 0.5 for a generator that contributed a single candidate (neutral, not a
+// free top slot). Raw scores cannot be compared across generators -- see the
+// ranges measured below -- so this is the only form in which GE's engagement
+// signal orders a mixed list.
+function generatorRank(cands: Candidate[]): number[] {
+  const groups = new Map<string, number[]>();
+  cands.forEach((c, i) => {
+    const key = typeof c.generator_name === 'string' ? c.generator_name : '?';
+    const g = groups.get(key);
+    if (g) g.push(i); else groups.set(key, [i]);
+  });
+  const pct = new Array<number>(cands.length).fill(0.5);
+  for (const idxs of groups.values()) {
+    if (idxs.length === 1) continue;
+    idxs.sort((a, b) => (cands[b].geScore ?? -Infinity) - (cands[a].geScore ?? -Infinity));
+    const last = idxs.length - 1;
+    idxs.forEach((ci, pos) => { pct[ci] = (last - pos) / last; });
+  }
+  return pct;
+}
+
+// The feed's final order: GE's own candidate score, for posts the vector has
+// already selected.
 //
-// The alternative, and what this replaced, was to leave the list in the order the
-// sort above left it: descending vector probability. That is the order the
-// shortlist was *selected* on, so using it again as the *ordering* means the rank
-// stage contributed nothing at all. Selection and ordering are different jobs, and
-// the reranker existed to do the second one.
+// It began as the fallback for when GE's /rank/predict call did not happen, and
+// became the only order when that call was removed: it needed the pipeline done
+// by ~2.85s to fit the appview's 5s, so this was already what nearly every reader
+// got. The alternative is to leave the list in the order the sort above left it,
+// descending vector probability. That is the order the shortlist was *selected*
+// on, so using it again as the *ordering* means nothing orders it at all.
+// Selection and ordering are different jobs.
 //
-// GE's score is the closest thing to it already in hand: it is the engagement
-// signal the rerank call blends with `candidate_score` anyway, it costs no round
-// trip, and it arrived with the candidates. Selection is untouched -- these are
-// still the top MAX_RERANK_CANDIDATES by vector -- so this reorders posts that have
-// all already cleared the axis, which is exactly the reranker's remit.
+// GE's score is the engagement signal the rerank call used to blend in, it costs
+// no round trip, and it arrived with the candidates. Selection is untouched --
+// these are still the top MAX_FEED_LENGTH by vector -- so this only reorders posts
+// that have all already cleared the axis.
 //
 // It is NOT sorted on raw `score`, because those are not one scale. Measured over
 // a live 500-candidate pool, the three generators in this feed's mix occupy
@@ -170,67 +186,28 @@ type Candidate = {
 //
 // Falls back to leaving the order alone when the generator sent no numeric scores
 // at all, since sorting every candidate by the same null would shuffle a list that
-// at least means something. `errs` records which of the two happened.
+// at least means something. `errs` records only that fallback; ordering by GE
+// score is the normal case and is not an error.
 function orderByGeneratorScore(cands: Candidate[], errs: string[]): void {
   if (!cands.some(c => typeof c.geScore === 'number')) {
-    errs.push('ge-rank:fallback-vector');
+    errs.push('order:no-gescore');
     return;
   }
-
-  const groups = new Map<string, number[]>();
-  cands.forEach((c, i) => {
-    const key = typeof c.generator_name === 'string' ? c.generator_name : '?';
-    const g = groups.get(key);
-    if (g) g.push(i); else groups.set(key, [i]);
-  });
-
-  const pct = new Array<number>(cands.length).fill(0.5);
-  for (const idxs of groups.values()) {
-    if (idxs.length === 1) continue; // stays 0.5: neutral, not top
-    idxs.sort((a, b) => (cands[b].geScore ?? -Infinity) - (cands[a].geScore ?? -Infinity));
-    const last = idxs.length - 1;
-    idxs.forEach((ci, pos) => { pct[ci] = (last - pos) / last; });
-  }
+  const pct = generatorRank(cands);
 
   // Vector probability breaks ties, so candidates that land on the same normalised
   // rank keep a meaningful order rather than a sort-stable accident.
   const keyed = cands.map((c, i) => ({ c, p: pct[i] }));
   keyed.sort((a, b) => (b.p - a.p) || ((b.c.score || 0) - (a.c.score || 0)));
   keyed.forEach((k, i) => { cands[i] = k.c; });
-  errs.push('ge-rank:fallback-gescore');
 }
 
-// Length gate behind FeedConfig.minWords: is there enough text here to be worth
-// embedding? URLs are stripped first (a bare link says nothing the vector can
-// read), and a whitespace token only counts as a word if it holds a letter or
-// digit, so a row of emoji or ellipses counts as zero rather than several.
-//
-// The character escape hatch exists because whitespace tokenizing badly
-// undercounts scripts that don't delimit words with spaces: measured on a live
-// 500-candidate pool it rescued 10 posts the word count alone would have cut,
-// 7 of them substantial Japanese or Thai posts. Counting only letters and
-// digits keeps the escape from being opened by a wall of emoji.
-const URL_RE = /(?:https?:\/\/|www\.)\S+/g;
-const WORDY_RE = /[\p{L}\p{N}]/u;
-function hasEnoughText(text: string, minWords: number): boolean {
-  const stripped = (text || '').replace(URL_RE, ' ');
-  let words = 0, chars = 0;
-  for (const tok of stripped.split(/\s+/)) {
-    if (!WORDY_RE.test(tok)) continue;
-    words++;
-    for (const ch of tok) if (WORDY_RE.test(ch)) chars++;
-  }
-  return words >= minWords || chars >= minWords * 5;
-}
 type SkeletonBody = { feed: { post: string }[]; cursor?: string };
 
-const SKELETON_TTL_SEC = 60;
 
 // --- Feed request diagnostics ---------------------------------------------
-// One structured line per getFeedSkeleton request (hit AND miss) so we can see
-// whether each page was served personalized or fell back to the public
-// (English) AppView — and, on cache hits, whether a personalized key is
-// re-serving a body that was produced by an earlier public fallback.
+// One structured line per getFeedSkeleton request, whichever path served it
+// (fresh, cont, reuse, stale, anon, error), so every request is countable.
 function logFeed(fields: Record<string, unknown>) {
   try { console.log('[feed] ' + JSON.stringify(fields)); } catch { /* never break the response */ }
   // The same line, kept where it can be queried. console output is not
@@ -316,7 +293,8 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
   };
 }
 
-// Deadlines on the two upstream calls a feed request cannot proceed without.
+// Deadline on the upstream call a feed request cannot proceed without. (There
+// were two; the GE rerank call has been removed -- see (4).)
 //
 // Without one, a hung dependency does not fail — it just stops, and the request
 // stalls until the platform kills the isolate. Nothing is written in that case:
@@ -326,12 +304,11 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 //
 // A deadline converts that silence into a path the code already handles: a
 // generate that gives up leaves an empty candidate pool (empty feed, already the
-// behaviour when GE errors), and a rank that gives up leaves the vector's own
-// order (already the behaviour when the rerank fails). Both finish the request,
-// and therefore both land in feed_logs with `errors` set.
+// behaviour when GE errors). That finishes the request, and therefore lands in
+// feed_logs with `errors` set.
 //
 // Sized against the request's own budget, not each call in isolation. The whole
-// pipeline has 10s; generate, embed and rank run in series inside it, so a
+// pipeline had 10s (now 5s, see below); generate and embed run in series inside it, so a
 // per-call deadline is only honest if the deadlines can all be paid at once. 8s
 // for generate could not be: it left 2s for everything downstream, which means
 // the deadline would never have fired before the isolate was killed -- exactly
@@ -350,11 +327,7 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 // feeds.ts). The GE call itself measures 1.2-1.9s there; the rest of t_cand is
 // this worker decoding the payload, which halves with it. 2.5s covers the call
 // with room for the decode, and the budget takes back anything it cannot pay.
-//
-// Rank drops with it. ~0.5s measured, 1.4s at its worst in feed_logs, and it can
-// no longer be allowed six seconds it has never used and could not spend.
 const GE_GENERATE_TIMEOUT_MS = 2500;
-const GE_RANK_TIMEOUT_MS = 1200;
 
 // A generate that fails *early* leaves budget on the table, and the failures that
 // actually show up here -- a dropped connection, a 502 from a rolling deploy, a
@@ -425,18 +398,17 @@ const GE_GENERATE_RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]
 const APPVIEW_SKELETON_TIMEOUT_MS = 5000;
 const APPVIEW_NETWORK_MARGIN_MS = 700;
 const REQUEST_BUDGET_MS = APPVIEW_SKELETON_TIMEOUT_MS - APPVIEW_NETWORK_MARGIN_MS;
-// Held out of the budget for the work after the last stage: serializing the body,
-// the public skeleton cache put, the response. None of that is deadlined, so it
+// Held out of the budget for the work after the last stage: serializing the body
+// and the response. None of that is deadlined, so it
 // has to come out of the budget rather than off the end of it.
 const RESPONSE_RESERVE_MS = 500;
 
 // Floors. Below these a stage cannot finish even at the fastest it has been
 // observed to run, so starting it would spend the reader's remaining time to
 // reach the same failure path, later. Measured at numCandidates 500: generate
-// 1.4-2.2s, one Jina round 0.7-3.9s, rank ~0.5s.
+// 1.4-2.2s, one Jina round 0.7-3.9s.
 const GE_GENERATE_MIN_MS = 1200;
 const JINA_MIN_MS = 700;
-const GE_RANK_MIN_MS = 500;
 
 // Cap on any single blocking DB call. The driver bounds one HTTP attempt
 // (DB_REQUEST_TIMEOUT_MS) but not the retry sequence around it, and these calls
@@ -451,12 +423,11 @@ const GE_RANK_MIN_MS = 500;
 // nothing.
 const DB_STAGE_TIMEOUT_MS = 600;
 
-// Below this much budget left after the candidates are in, the scoring stages
-// cannot produce anything the appview will still accept, so the request stops
-// spending and serves the last good list instead. Sized as what the cheapest
-// useful finish costs: the score-cache read, the vector's own order over an
-// already-hydrated pool, and the write. A request that bails here is one the old
-// code would have spent two more seconds on and then had discarded.
+// Below this much budget left after the candidates are in, no paid stage can run
+// (see (3z)), and the request is tagged `budget:gather-overran`. It no longer
+// changes what is served -- the stages skip themselves on their own floors and the
+// request finishes on cached and free scores -- so this is now only the threshold
+// the tag is reported at, kept at its old value so feed_logs stays comparable.
 const PIPELINE_FINISH_MIN_MS = 900;
 
 // The stale read is allowed this much even when the budget is gone -- see
@@ -472,35 +443,22 @@ const STALE_READ_FLOOR_MS = 400;
 // it is handed.
 const JINA_STAGE_TIMEOUT_MS = 1200;
 
-// Held back from the scoring stages for the session write. The write is what
-// produces the cursor, and without a cursor the reader gets one page and cannot
-// scroll -- a worse outcome than a slightly less well-ordered feed, which is what
-// giving this time to the reranker instead would buy. Ranked by what the reader
-// loses: the paid scores first, then the ability to page, then GE's rerank, whose
-// absence already has a defined fallback in the vector's own order.
-const SESSION_WRITE_RESERVE_MS = 450;
+// Nothing is held back for writes any more. The session and score-cache writes
+// both run after the response (runAfterResponse), so the only thing left to
+// reserve for is the response itself (RESPONSE_RESERVE_MS). The per-stage caps
+// still keep one stage from spending everything: the paid stage is the last one
+// that waits on the network, and JINA_STAGE_TIMEOUT_MS bounds it.
 
 type Budget = {
   remaining: () => number;
   slice: (cap: number) => number;
-  sliceReserving: (cap: number, reserve: number) => number;
 };
 
 function requestBudget(t0: number): Budget {
   const deadline = t0 + REQUEST_BUDGET_MS - RESPONSE_RESERVE_MS;
   const remaining = () => Math.max(0, deadline - Date.now());
   const slice = (cap: number) => Math.min(cap, remaining());
-  // slice(), but holding `reserve` back for a stage that runs later. Without this
-  // the stages are strictly greedy -- each takes min(its cap, everything left) --
-  // so an early stage with a large cap silently spends what a later one needs, and
-  // the later one is skipped on a budget the earlier one did not require. That is
-  // not hypothetical: JINA_TIMEOUT_MS is 15s, a transport-level stall guard, so the
-  // embed stage took the entire remainder on every request and the session write
-  // behind it missed its deadline by 400ms. The reader got a feed with no cursor
-  // and could not scroll.
-  const sliceReserving = (cap: number, reserve: number) =>
-    Math.min(cap, Math.max(0, remaining() - reserve));
-  return { remaining, slice, sliceReserving };
+  return { remaining, slice };
 }
 
 // Bound a call that has no AbortSignal of its own -- the DB helpers -- against the
@@ -573,8 +531,7 @@ const SEEN_PRUNE_PROBABILITY = 0.02;
 // timing, while seen-exclusion still runs at page 1 for cross-session freshness.
 //
 // Cursor wire format: `${sessionId}.${offset}`. sessionId is a UUID (no dots),
-// so we split on the last dot. SESSION_TTL_MS must exceed the public skeleton
-// cache TTL so a cached public START body keeps pointing at a still-live session.
+// so we split on the last dot.
 const SESSION_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_PAGE_SIZE = 30;
 const MAX_PAGE_SIZE = 100;
@@ -609,62 +566,6 @@ function decodeCursor(raw: string | undefined): { sessionId: string; offset: num
   return { sessionId, offset };
 }
 
-// The skeleton cache uses the Bunny Edge Cache API. Caching is only an
-// optimization, so any cache failure degrades to a miss / no-op and never
-// breaks the feed response.
-async function safeCacheMatch(cache: Cache, key: string): Promise<Response | undefined> {
-  try {
-    return await cache.match(key);
-  } catch (e) {
-    console.error("[cache] match failed (treating as miss):", (e as any)?.message);
-    return undefined;
-  }
-}
-
-async function safeCachePut(cache: Cache, key: string, res: Response): Promise<void> {
-  try {
-    await cache.put(key, res);
-  } catch (e) {
-    console.error("[cache] put failed (skipping):", (e as any)?.message);
-  }
-}
-
-// The last public ranked list that was produced successfully, for the staleness
-// fallback at (4b). Anonymous readers have no feed_sessions row to fall back on
-// -- sessions are stored against a DID and the public ones cannot be looked up by
-// one -- so the public equivalent is kept here instead: one entry per feed,
-// written on every successful public response and read only when the pipeline
-// produced nothing.
-//
-// Shaped to match getLatestFeedSession so (4b) can treat the two identically. The
-// stored body is a skeleton, so its URIs are recovered from `feed`, and its age
-// from the timestamp written beside it rather than from the Cache API (whose
-// freshness is what decides that the entry still exists at all, not how old it
-// is). sessionId is empty: the ranked list behind a public body belongs to a
-// session this reader does not own, so the fallback serves page 1 without a
-// cursor rather than handing out one that (2) would reject.
-async function readLastGoodPublic(
-  cache: Cache,
-  key: string,
-): Promise<{ sessionId: string; uris: string[]; createdAt: number } | null> {
-  const res = await safeCacheMatch(cache, key);
-  if (!res || res.status !== 200) return null;
-  try {
-    const body = await res.json() as SkeletonBody;
-    const uris = Array.isArray(body?.feed) ? body.feed.map(f => f.post).filter(Boolean) : [];
-    if (!uris.length) return null;
-    const storedAt = Number(res.headers.get('X-Stored-At'));
-    return {
-      sessionId: '',
-      uris,
-      createdAt: Number.isFinite(storedAt) ? storedAt : 0,
-    };
-  } catch (e) {
-    console.error("[cache] last-good parse failed (treating as miss):", (e as any)?.message);
-    return null;
-  }
-}
-
 // Score candidates, reusing scores cached in the DB and only sending cache
 // misses to Jina. Returns scores aligned to `cands` (null where scoring failed)
 // plus the tokens actually billed (misses only) and cache/fan-out counters for
@@ -677,12 +578,18 @@ async function readLastGoodPublic(
 // a cost optimization that actively hurt latency. Caching the scalar cuts the
 // same read to ~15 KB.
 //
-// SCORE_CACHE_VERSION scopes entries to the embedding model AND the scoring
-// vector, so retraining either invalidates old rows by simple cache miss.
-// Also what keeps two feeds' scores for the same post apart: each vector has its
-// own fingerprint, and (uri, version) is the score cache's key.
-function scoreCacheVersion(scorer: { version: string }): string {
-  return `${EMBEDDING_MODEL}:${scorer.version}`;
+// The cache key's version half is scoreCacheVersion() in feeds.ts.
+
+// Batch-load cached scores for `cands`. Best-effort and never rejects: a DB error
+// or a missed deadline just means "all miss". Bounded like every other DB call even
+// though missing the cache makes the Jina stage bigger, not smaller -- a read that
+// has not answered in DB_STAGE_TIMEOUT_MS was never going to return hits in time to
+// save anything.
+function readScoreCache(cands: Candidate[], feed: FeedConfig, budget: Budget): Promise<Map<string, number>> {
+  return withDeadline(
+    getCachedScores(cands.map(c => c.uri), scoreCacheVersion(feed.scorer)),
+    budget.slice(DB_STAGE_TIMEOUT_MS), 'score-cache-read')
+    .catch((e: any) => { console.error("[score cache] read failed:", errChain(e)); return new Map<string, number>(); });
 }
 
 type ScoreResult = {
@@ -700,17 +607,24 @@ async function scoreCandidates(
   feed: FeedConfig,
   budget: Budget,
   errs: string[],
+  /**
+   * The cache read, already in flight. The request starts it as soon as the pool
+   * is known (see readScoreCache), so it overlaps the prefilter instead of queueing
+   * behind it. May cover more URIs than `cands`; only lookups are done on it.
+   */
+  cachedP?: Promise<Map<string, number>>,
+  /**
+   * Whether a candidate without a Jina score still has something to be ranked on.
+   * True when the free prefilter scored the pool: a total Jina outage then leaves
+   * the shortlist in MiniLM order rather than failing the request, which is what a
+   * single failed chunk already does. False on the single-stage path, where Jina
+   * is the only score and an outage with no cache hits still has to be an error.
+   */
+  degradable = false,
 ): Promise<ScoreResult> {
   const scores: (number | null)[] = new Array(cands.length).fill(null);
 
-  // Batch-load cached scores. Best-effort: a DB error just means "all miss".
-  // Bounded like every other DB call even though missing the cache makes the Jina
-  // stage bigger, not smaller -- a read that has not answered in DB_STAGE_TIMEOUT_MS
-  // was never going to return hits in time to save anything.
-  const cached = await withDeadline(
-    getCachedScores(cands.map(c => c.uri), scoreCacheVersion(feed.scorer)),
-    budget.slice(DB_STAGE_TIMEOUT_MS), 'score-cache-read')
-    .catch((e: any) => { console.error("[score cache] read failed:", errChain(e)); return new Map<string, number>(); });
+  const cached = await (cachedP ?? readScoreCache(cands, feed, budget));
 
   // De-duplicate misses by uri: Jina is billed per unique text, and SQLite
   // rejects upserting the same row twice in one statement.
@@ -736,7 +650,7 @@ async function scoreCandidates(
     // (possibly nothing, which is an empty feed) and name it, rather than paying
     // Jina for embeddings that arrive after the request is gone. Deliberately not
     // the rethrow below, even with no hits: nothing is wrong with Jina here.
-    const jinaMs = budget.sliceReserving(JINA_STAGE_TIMEOUT_MS, SESSION_WRITE_RESERVE_MS);
+    const jinaMs = budget.slice(JINA_STAGE_TIMEOUT_MS);
     if (jinaMs < JINA_MIN_MS) {
       console.error(`[score cache] skipping Jina: ${jinaMs}ms of budget left, serving ${hits} cached score(s)`);
       errs.push('jina:no-budget');
@@ -744,16 +658,17 @@ async function scoreCandidates(
     }
 
     // getEmbeddingsBatched throws only when EVERY chunk failed (a total Jina
-    // outage). Now that the cache is load-bearing we can ride that out: if some
-    // candidates were served from cache, rank those instead of failing the whole
-    // request. With no hits either there is nothing to serve, so rethrow and let
-    // the handler return its 500 as before.
+    // outage). Ride that out whenever there is something left to rank on: cached
+    // scores, or the free prefilter's scores for the whole shortlist (`degradable`).
+    // Only with neither -- no hits, no prefilter -- is there nothing to serve, and
+    // then the handler returns its 500 as before.
     let res: Awaited<ReturnType<typeof getEmbeddingsBatched>>;
     try {
       res = await getEmbeddingsBatched(missTexts, apiKey, jinaMs);
     } catch (e: any) {
-      if (hits === 0) throw e;
-      console.error(`[score cache] all Jina chunks failed; serving ${hits} cached score(s) only:`, e?.message ?? String(e));
+      if (hits === 0 && !degradable) throw e;
+      console.error(`[score cache] all Jina chunks failed; serving ${hits} cached score(s)${degradable ? ' + prefilter order' : ''}:`, e?.message ?? String(e));
+      errs.push(stageErr('jina:all-failed', e));
       return { scores, tokens: 0, hits, misses: missUris.length, chunks: 0, failedChunks: 0 };
     }
     tokens = res.tokens;
@@ -772,14 +687,14 @@ async function scoreCandidates(
       }
     }
 
-    // Persist the freshly-computed scores. Awaited rather than deferred past the
-    // response: the vector version of this write was 5 sequential ~1.2 MB upserts,
-    // which is why it was moved behind waitUntil — but the score payload is ~1500x
-    // smaller (one ~50 KB statement), so a single inline round-trip costs ~30ms on
-    // a multi-second request. That buys certainty: the cache warming is the entire
-    // point of this path, and a deferred write that silently fails would leave the
-    // cache permanently cold with no signal. Prunes and telemetry, which nothing
-    // depends on, still go through runAfterResponse.
+    // Persist the freshly-computed scores, after the response. This was awaited
+    // inline for certainty, and that certainty depended on budget held back for
+    // the session write behind it. With that write also deferred there is no
+    // reserve left to protect it: a Jina call that used its whole slice would
+    // leave this write no time, and the cache would silently stop warming.
+    // Nothing in this request reads what it writes, and waitUntil is confirmed
+    // on this runtime (it carries every feed_logs row). If it ever fails
+    // persistently, the signal is cache_hit falling towards 0 in feed_logs.
     //
     // Scored against EVERY registered vector, not just the one this request
     // needs, and stored as a row per version. The Jina call is what costs money;
@@ -796,8 +711,9 @@ async function scoreCandidates(
         toStore.push({ uri: missUris[k], score: scorer.score(emb).probability, version });
       }
     }
-    await withDeadline(putScores(toStore), budget.slice(DB_STAGE_TIMEOUT_MS), 'score-cache-write')
-      .catch((e: any) => console.error("[score cache] write failed:", errChain(e)));
+    runAfterResponse(
+      putScores(toStore).catch((e: any) => console.error("[score cache] write failed:", errChain(e)))
+    );
   }
 
   // Opportunistically keep the table bounded. Deferred past the response via
@@ -843,96 +759,34 @@ async function handleRequest(request: Request): Promise<Response> {
         return new Response(JSON.stringify({ error: "Missing GE API Key" }), { status: 500 });
       }
 
-      // Extract User DID from ATProto Service JWT
-      const authHeader = request.headers.get('Authorization');
-      let userDid = null;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        try {
-          const decoded: any = jwtDecode(authHeader.substring(7));
-          userDid = decoded.iss; // Service JWT issuer is the user's DID
-        } catch (e) { }
-      }
       const feedUriParam = url.searchParams.get('feed') || '';
       const rkey = feedUriParam.split('/').pop() || 'unknown';
       // Which vector ranks this request, and at what gate. An unknown rkey falls
       // back to the locus-of-control feed rather than erroring.
       const feedConfig = resolveFeed(rkey);
-
-      if (feedConfig.forcePublic) {
-        userDid = null; // force unauthenticated path
-      }
-
-      const didTag = shortDid(userDid);
-
-      // (1) Serve from the scored-skeleton cache when fresh. Keyed by feed identity +
-      // user DID (or "public") + pagination cursor. A hit returns instantly and
-      // skips the upstream fetches, embeddings, and the OAuth restore/lock below.
       const startCursor: string | undefined = url.searchParams.get('cursor') || undefined;
       const limit = parseLimit(url.searchParams.get('limit'));
-      // `limit` is part of the key: the cached (public) body is already sliced to
-      // a page size, so a client asking for a different limit must not be served
-      // another's slice.
       // What this reader's client will show of whatever we return (see
-      // readerLangs). Part of the cache key, not just the ranking: the
-      // German-first list built below is the wrong feed for an English reader,
-      // and the public cache is shared across readers.
+      // readerLangs): a German-only reader gets a German-first list.
       const rLangs = readerLangs(request.headers.get('accept-language'));
       const deReader = prefersGermanOnly(rLangs);
-      const cacheKey = `${rkey}:${userDid || 'public'}:${startCursor || 'START'}:l${limit}:${deReader ? 'de' : 'any'}`;
 
-      const skeletonCacheUrl = new URL(request.url);
-      skeletonCacheUrl.pathname = '/_cache/skeleton';
-      skeletonCacheUrl.search = '';
-      skeletonCacheUrl.searchParams.set('key', cacheKey);
-      const skeletonCacheKeyStr = skeletonCacheUrl.toString();
-
-      // Key for the last-good public list (see readLastGoodPublic and the write
-      // below). Deliberately keyed by feed alone -- not by cursor, not by page
-      // size. There is exactly one "the last public feed that worked", the stored
-      // body is the whole ranked list and the reader slices it to its own `limit`,
-      // and an entry keyed by the cursor or limit of the request that wrote it
-      // could never be found by the failing request that needs it.
-      const lastGoodCacheUrl = new URL(request.url);
-      lastGoodCacheUrl.pathname = '/_cache/lastgood';
-      lastGoodCacheUrl.search = '';
-      lastGoodCacheUrl.searchParams.set('key', rkey);
-      const lastGoodCacheKeyStr = lastGoodCacheUrl.toString();
-
-      const cache = caches.default;
-      // Personalized feeds are never cached (see the write path below): every
-      // logged-in request recomputes so seen-post exclusion (interactionSeen)
-      // takes effect immediately instead of lagging behind the cache TTL. Only
-      // the public/unauthenticated feed is served from — and written to — cache.
-      const cachedSkeleton = userDid ? undefined : await safeCacheMatch(cache, skeletonCacheKeyStr);
-
-      if (cachedSkeleton && cachedSkeleton.status === 200) {
-        const body = await cachedSkeleton.json();
-        // Cache hits were previously silent. A public-fallback response cached
-        // under a personalized key would be re-served as "English" with no
-        // trace — surface the markers we stored on write so it shows in logs.
-        logFeed({
-          feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'hit',
-          personalized: cachedSkeleton.headers.get('X-Personalized'),
-          path: cachedSkeleton.headers.get('X-Feed-Path'),
-          cand: cachedSkeleton.headers.get('X-Cand-Count'),
-          pass: cachedSkeleton.headers.get('X-Pass-Count'),
-          feedLen: Array.isArray((body as any)?.feed) ? (body as any).feed.length : null,
-          nextCursor: (body as any)?.cursor ? 'y' : 'n',
-          ms: Date.now() - t0,
-        });
-        return new Response(JSON.stringify(body), {
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Cache': 'hit',
-            // Never let the Bunny PullZone CDN cache the personalized skeleton:
-            // it keys on neither the cursor nor the per-user Authorization/DID, so
-            // one cached copy freezes the feed for everyone. This response is
-            // already served from our own per-(user,cursor) caches.default; the
-            // CDN layer on top must pass through.
-            'Cache-Control': 'no-store',
-          },
+      // (1) Signed-in readers only. Everything below is built around a reader:
+      // candidates come from who they follow, seen posts are excluded, and the
+      // ranked list is frozen under their DID. There used to be a whole second
+      // path for logged-out requests (GE's `popularity` mix under a borrowed DID,
+      // a shared skeleton cache, a public last-good list), and essentially no
+      // traffic ever used it. A logged-out request now gets an empty feed at once,
+      // which the app shows as an empty feed rather than an error.
+      const userDid = didFromAuth(request);
+      if (!userDid) {
+        logFeed({ feed: rkey, did: 'anon', cursor: cursorTag(startCursor), cache: 'miss', page: 'anon',
+          feedLen: 0, nextCursor: 'n', ms: Date.now() - t0 });
+        return new Response(JSON.stringify({ feed: [] } satisfies SkeletonBody), {
+          headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Page-Path': 'anon' },
         });
       }
+      const didTag = shortDid(userDid);
 
       // (2) Continuation page: the cursor points at a frozen ranked list from an
       // earlier page-1 request. Read it back and slice the next window — no GE,
@@ -947,7 +801,7 @@ async function handleRequest(request: Request): Promise<Response> {
           getFeedSession(decoded.sessionId), budget.slice(DB_STAGE_TIMEOUT_MS), 'session-read')
           .catch((e: any) => { console.error("[getFeedSkeleton] session read failed:", errChain(e)); return null; });
         const fresh = !!session && (Date.now() - session.createdAt) < SESSION_TTL_MS;
-        const ownerOk = !!session && (session.did || null) === (userDid || null);
+        const ownerOk = !!session && session.did === userDid;
         if (session && fresh && ownerOk) {
           const page = session.uris.slice(decoded.offset, decoded.offset + limit);
           const nextOffset = decoded.offset + page.length;
@@ -966,7 +820,7 @@ async function handleRequest(request: Request): Promise<Response> {
               // Never let the PullZone CDN cache the personalized skeleton (keys on
               // neither cursor nor DID). Our own per-key stores handle caching.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'minilm-prefilter-1',
+              'X-Feed-Version': 'minilm-prefilter-2',
             },
           });
         }
@@ -982,7 +836,24 @@ async function handleRequest(request: Request): Promise<Response> {
       // not-yet-excluded posts are ones shown seconds ago — i.e. what's on screen,
       // which a reload should keep showing anyway. Best-effort: any read failure
       // falls through to a fresh generation.
-      if (userDid && !startCursor) {
+      // The seen-post read the fresh pipeline needs below, started now so it runs
+      // alongside the (2b) read instead of after it. The two are independent, and
+      // in series they each took their own DB_STAGE_TIMEOUT_MS out of the budget:
+      // ~30ms apiece normally, but a cold replica attach lands on whichever read
+      // comes first, and the second one paid for it again out of the generate
+      // stage's time. Only started where it will almost always be used -- a signed-in
+      // START request. A cursor request is served by (2) far more often than not, so
+      // its seen read is started lazily below, on the rare fall-through.
+      const readSeen = (did: string) => withDeadline(
+        getSeenUris(did, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS),
+        budget.slice(DB_STAGE_TIMEOUT_MS), 'seen-uris');
+      const seenEarly: Promise<string[]> | null = !startCursor ? readSeen(userDid) : null;
+      // Subscribed now, because nothing awaits it until (2b) has finished: a
+      // rejection landing in between would otherwise be unhandled at the isolate
+      // level. The real handler below still receives the rejection.
+      seenEarly?.catch(() => {});
+
+      if (!startCursor) {
         const latest = await withDeadline(
           getLatestFeedSession(userDid), budget.slice(DB_STAGE_TIMEOUT_MS), 'latest-session-read')
           .catch((e: any) => { console.error("[getFeedSkeleton] latest-session read failed:", errChain(e)); return null; });
@@ -995,23 +866,24 @@ async function handleRequest(request: Request): Promise<Response> {
             off: 0, limit, feedLen: page.length,
             nextCursor: body.cursor ? 'y' : 'n', ms: Date.now() - t0,
           });
+          // The early seen read is not needed on this path. Its fetch was issued
+          // inside the request, so let it settle rather than abandoning it
+          // mid-flight; withDeadline already absorbs its rejection.
+          if (seenEarly) runAfterResponse(seenEarly.catch(() => {}));
           return new Response(JSON.stringify(body), {
             headers: {
               'Content-Type': 'application/json',
               'X-Cache': 'miss',
               'X-Page-Path': 'reuse',
-              // Same reasoning as the other personalized paths: keep the PullZone
-              // CDN out of it; our per-user session store already caches.
+              // Keep the PullZone CDN out of it; the session store already caches.
               'Cache-Control': 'no-store',
-              'X-Feed-Version': 'minilm-prefilter-1',
+              'X-Feed-Version': 'minilm-prefilter-2',
             },
           });
         }
       }
 
       let candidates: Candidate[] = [];
-      const personalized = !!userDid;
-      const feedPath = personalized ? 'personalized' : 'public-no-did';
       
       const tG = Date.now();
       const geHeaders = {
@@ -1019,7 +891,6 @@ async function handleRequest(request: Request): Promise<Response> {
         'X-API-Key': geApiKey
       };
       
-      const primaryGenerator = userDid ? 'followed_users' : 'popularity';
 
       // Exclude posts this user has already been shown so paging/refreshing
       // doesn't repeat them. Best-effort: a DB failure just means no exclusion
@@ -1034,12 +905,13 @@ async function handleRequest(request: Request): Promise<Response> {
       // thing that can fail, and a request that silently stopped excluding posts
       // is exactly the kind of degradation this column exists to show.
       const errs: string[] = [];
+      // tSeen is the time this request still had to wait for the read here, not
+      // the read's own duration: a read started early (seenEarly) has usually
+      // already finished behind the (2b) read, and then this is ~0.
       let tS_start = Date.now();
       let excludeUris: string[] = [];
-      if (userDid) {
-        excludeUris = await withDeadline(
-          getSeenUris(userDid, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS),
-          budget.slice(DB_STAGE_TIMEOUT_MS), 'seen-uris')
+      {
+        excludeUris = await (seenEarly ?? readSeen(userDid))
           .catch((e: any) => {
             console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e));
             errs.push(stageErr('seen-uris', e));
@@ -1086,23 +958,21 @@ async function handleRequest(request: Request): Promise<Response> {
         reason: string,
         extra: Record<string, unknown>,
       ): Promise<Response | null> => {
-        const stale = userDid
-          ? await withDeadline(
-              getLatestFeedSession(userDid),
-              Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), STALE_READ_FLOOR_MS),
-              'stale-fallback-read')
-              .catch((e: any) => {
-                console.error("[getFeedSkeleton] stale fallback read failed:", errChain(e));
-                return null;
-              })
-          : await readLastGoodPublic(cache, lastGoodCacheKeyStr);
+        const stale = await withDeadline(
+          getLatestFeedSession(userDid),
+          Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), STALE_READ_FLOOR_MS),
+          'stale-fallback-read')
+          .catch((e: any) => {
+            console.error("[getFeedSkeleton] stale fallback read failed:", errChain(e));
+            return null;
+          });
         if (!stale || stale.uris.length === 0) return null;
         const ageMs = Date.now() - stale.createdAt;
         if (ageMs >= SESSION_TTL_MS) return null;
 
         const page = stale.uris.slice(0, limit);
         const body: SkeletonBody = { feed: page.map(uri => ({ post: uri })) };
-        if (stale.sessionId && limit < stale.uris.length) {
+        if (limit < stale.uris.length) {
           body.cursor = encodeCursor(stale.sessionId, limit);
         }
         // Named in `errors` rather than hidden by the recovery: a request that
@@ -1111,7 +981,6 @@ async function handleRequest(request: Request): Promise<Response> {
         errs.push(reason);
         logFeed({
           feed: rkey, did: didTag, cursor: cursorTag(startCursor), cache: 'miss', page: 'stale',
-          personalized: String(personalized), path: feedPath,
           off: 0, limit, feedLen: page.length,
           nextCursor: body.cursor ? 'y' : 'n',
           ms: Date.now() - t0,
@@ -1127,7 +996,7 @@ async function handleRequest(request: Request): Promise<Response> {
             // Personalized or not, this body is one reader's list and is already
             // served from our own stores; keep the PullZone CDN out of it.
             'Cache-Control': 'no-store',
-            'X-Feed-Version': 'minilm-prefilter-1',
+            'X-Feed-Version': 'minilm-prefilter-2',
             'X-Stale-Age-Ms': String(ageMs),
           },
         });
@@ -1142,7 +1011,7 @@ async function handleRequest(request: Request): Promise<Response> {
           const b: any = {
             generators: gens,
             infill: 'popularity',
-            user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur', // fallback DID if none
+            user_did: userDid,
             num_candidates: feedConfig.numCandidates ?? 500,
             // Restrict candidates to the last 3 days. GE's allowed values are
             // 6/12/24/48/72/168; the infill generator inherits this window too,
@@ -1167,7 +1036,7 @@ async function handleRequest(request: Request): Promise<Response> {
         // sample each time (the mix repeats itself 99%), so it is what actually
         // grows the pool past GE's 1000-per-request cap.
         const bodies = [buildBody([
-          { name: primaryGenerator, weight: 1.0 },
+          { name: 'followed_users', weight: 1.0 },
           { name: 'network_likes', weight: 1.0 },
           { name: 'two_tower', weight: 1.0 },
         ])];
@@ -1267,25 +1136,34 @@ async function handleRequest(request: Request): Promise<Response> {
       
       const gatherMs = Date.now() - tG;
 
-      // (3z) Out of time before the paid stages. The candidates are in, but not
-      // early enough for anything downstream to reach the reader: the appview
-      // stops waiting at APPVIEW_SKELETON_TIMEOUT_MS and throws the whole response
-      // away, so a feed finished after that point is indistinguishable from no
-      // feed at all. The old code did not know that and spent the time anyway --
-      // 165 of 247 fresh requests over a week were built, logged as clean, and
-      // discarded in flight.
+      // (3y) Score-cache read, started the moment the pool is known rather than
+      // after the prefilter has picked the paid pool. It covers the whole pool
+      // (~474 URIs, three concurrent chunks, the same ~30ms as one), so it runs
+      // while the prefilter below does its CPU work, and so the cached Jina scores
+      // are already in hand if the budget runs out before anything is paid for.
+      // Never rejects; a failure is an empty map, i.e. every candidate a miss.
+      const cachedEarly = candidates.length > 0
+        ? readScoreCache(candidates, feedConfig, budget)
+        : null;
+
+      // (3z) Short on time before the paid stages. This used to stop here and
+      // serve the reader's last list, up to SESSION_TTL_MS old: no seen-exclusion
+      // since it was built, and nothing at all for a reader with no recent list.
+      // With the cache read already in flight the pipeline has a cheaper finish
+      // than that. Jina skips itself on a budget this small (JINA_MIN_MS), so the
+      // rest of the request is the cache read that is already running, the MiniLM
+      // ranking and a local sort; both writes happen after the response. What the
+      // reader gets is this request's own pool: cached Jina scores where they
+      // exist and the free score for the rest, which is also what `jina:no-budget`
+      // has always served. Only if that comes out empty does (4b) fall back to the
+      // last list.
       //
-      // So stop here and serve the last good list, which is ready now. The trade
-      // is a feed up to SESSION_TTL_MS stale against one the reader never sees,
-      // and it is only reached when the gather already overran; a request with
-      // budget left still generates fresh, exactly as before.
+      // Tagged under the same name as before so feed_logs stays comparable. The
+      // row now reads page=fresh with this in `errors`, and page=stale means (4b)
+      // had to step in.
       if (budget.remaining() < PIPELINE_FINISH_MIN_MS) {
-        console.error(`[getFeedSkeleton] out of budget after gather: ${budget.remaining()}ms left, serving last good list`);
-        const staleRes = await serveStale('budget:gather-overran', {
-          candRaw, candShort, cand: candidates.length, pass: 0,
-          gatherMs, tSeen, tPrune, tCand,
-        });
-        if (staleRes) return staleRes;
+        console.error(`[getFeedSkeleton] short of budget after gather: ${budget.remaining()}ms left, finishing on cached + free scores`);
+        errs.push('budget:gather-overran');
       }
 
       const filteredCandidates: Candidate[] = [];
@@ -1375,15 +1253,33 @@ async function handleRequest(request: Request): Promise<Response> {
               .slice(0, deReader ? Math.max(0, paidBudget - taken.length) : pf.shortlist);
             preBypass = taken.length;
             preBypassDropped = detour.length - taken.length;
-            paidPool = [...kept.map(x => x.c), ...taken.map(x => x.c)];
-            miniScores = [...kept.map(x => x.p), ...taken.map(() => null)];
-            bypassed = [...kept.map(() => false), ...taken.map(() => true)];
-            preKept = paidPool.length;
             // Where the cut actually landed on this pool. With no fixed floor this
             // is the only way to see the stage's operating point, and it is what a
             // future recalibration of the paid gate has to be read against. The
-            // bypassed tail has no score of its own and is not part of it.
+            // bypassed tail has no score of its own and is not part of it. Read
+            // before the reorder below, while `kept` is still in free-score order.
             preFloor = kept.length ? (kept[kept.length - 1].p as number) : 0;
+
+            // The order the paid pool goes to Jina in. Selection is settled; this
+            // only decides which posts land in the early batches, which are the
+            // ones that come back when the deadline cuts the stage short (Jina
+            // throttles per key, so later requests queue behind earlier ones).
+            //
+            // Bypassed posts first: without a Jina score they are dropped outright,
+            // while an English post without one is still ranked on its free score.
+            // Then the English by GE engagement rank, because that is the feed's
+            // final order: the posts heading for page 1 get the best chance of a
+            // paid score. Nothing else reads this order -- the fuse and the final
+            // sort both re-sort.
+            const keptRank = generatorRank(kept.map(x => x.c));
+            const keptByEngagement = kept
+              .map((x, i) => ({ x, r: keptRank[i] }))
+              .sort((a, b) => b.r - a.r)
+              .map(k => k.x);
+            paidPool = [...taken.map(x => x.c), ...keptByEngagement.map(x => x.c)];
+            miniScores = [...taken.map(() => null), ...keptByEngagement.map(x => x.p)];
+            bypassed = [...taken.map(() => true), ...keptByEngagement.map(() => false)];
+            preKept = paidPool.length;
           } else {
             preFellBack = true;
             console.error(`[getFeedSkeleton] prefilter disabled: only ${preHydrated}/${candidates.length} candidates hydrated`);
@@ -1391,7 +1287,8 @@ async function handleRequest(request: Request): Promise<Response> {
         }
 
         // (3b) Reuse cached scores; only cache-missed posts are sent to Jina.
-        const scored = await scoreCandidates(paidPool, apiKey, feedConfig, budget, errs);
+        const scored = await scoreCandidates(
+          paidPool, apiKey, feedConfig, budget, errs, cachedEarly ?? undefined, miniScores !== null);
         embedHits = scored.hits;
         embedMisses = scored.misses;
         embedChunks = scored.chunks;
@@ -1422,9 +1319,9 @@ async function handleRequest(request: Request): Promise<Response> {
             if (bypassed?.[i] && (p === null || p < feedConfig.threshold)) continue;
             paidPool[i].minilmScore = miniScores[i];
             paidPool[i].jinaScore = p;
-            // Overwrite the generator's popularity `score` (unused after ranking)
-            // with the vector-similarity probability so GE's `candidate_score`
-            // model can blend it into the final rank order (see RANK_SIM_WEIGHT).
+            // Overwrite the generator's `score` (kept as geScore) with the vector
+            // probability, which fuseByRank and the sort below order on, and which
+            // breaks ties in orderByGeneratorScore.
             paidPool[i].score = p ?? miniScores[i] ?? 0;
             filteredCandidates.push(paidPool[i]);
           } else if (p !== null && p >= feedConfig.threshold) {
@@ -1438,98 +1335,39 @@ async function handleRequest(request: Request): Promise<Response> {
           fuseByRank(filteredCandidates);
         }
         filteredCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
-        // Before the cut, not after: MAX_RERANK_CANDIDATES is the whole length of
+        // Before the cut, not after: MAX_FEED_LENGTH is the whole length of
         // the feed, so a German post that falls past it is one this reader can
         // never be shown, however well it scored.
         if (deReader) germanFirst(filteredCandidates);
-        if (filteredCandidates.length > MAX_RERANK_CANDIDATES) {
-          filteredCandidates.length = MAX_RERANK_CANDIDATES;
+        if (filteredCandidates.length > MAX_FEED_LENGTH) {
+          filteredCandidates.length = MAX_FEED_LENGTH;
         }
 
         tEmbed = Date.now() - tE_start;
-        
-        // Fixed once, so the branch below and the signal it hands the fetch are
-        // deciding on the same number.
-        const rankMs = budget.sliceReserving(GE_RANK_TIMEOUT_MS, SESSION_WRITE_RESERVE_MS);
-        if (filteredCandidates.length > 0 && feedConfig.rankBy === 'score') {
-          // The vector IS the editorial criterion for this feed, and
-          // filteredCandidates is already sorted by it. Handing that order to
-          // GE's engagement ranker scrambles it — measured Spearman 0.277
-          // between served rank and assist score — so skip the rerank call
-          // entirely. Also saves a round-trip.
-          tRank = 0;
-        } else if (filteredCandidates.length > 0 && rankMs < GE_RANK_MIN_MS) {
-          // No budget left to rank in, so don't pay for a call that would be
-          // aborted before it returned -- take the fallback ordering now. Under the
-          // 5s appview deadline this is the common path, not the rare one, which is
-          // why it orders by GE's score rather than leaving the shortlist in
-          // selection order.
-          console.error(`[getFeedSkeleton] skipping GE rank: ${rankMs}ms of budget left`);
-          errs.push('ge-rank:no-budget');
+
+        // (4) Final order. Selection is done -- these are the feed's posts -- and
+        // what is left is which of them the reader sees first. There is no remote
+        // reranker any more: GE's /rank/predict needed the pipeline finished by
+        // ~2.85s to fit inside the appview's 5s, which it almost never was, so the
+        // order below was already what nearly every reader got. Doing it here, in
+        // the worker, costs no round trip and gives the budget it used to hold
+        // for the call back to the paid scoring stage.
+        //
+        // 'score' keeps the vector's own (fused) order, for a feed whose vector is
+        // the whole editorial criterion. The default orders by each generator's
+        // own engagement score, which is what the rerank call was there to add.
+        const tR_start = Date.now();
+        if (filteredCandidates.length > 0 && feedConfig.rankBy !== 'score') {
           orderByGeneratorScore(filteredCandidates, errs);
-          tRank = 0;
-        } else if (filteredCandidates.length > 0) {
-          const tR_start = Date.now();
-          // Only a rerank that actually produced an order counts. A non-200, an
-          // exception, and a 200 carrying no rankings are all the same outcome for
-          // the reader -- the list was not reordered -- so all three take the
-          // fallback below rather than silently serving selection order.
-          let reranked = false;
-          // (4) Rank via Green Earth
-          try {
-            const rankRes = await fetch('https://api.greenearth.social/rank/predict', {
-              method: 'POST',
-              headers: geHeaders,
-              body: JSON.stringify({
-                candidates: filteredCandidates,
-                models: [
-                  { name: 'heavy_ranker', weight: 1.0 },
-                  // Blend in vector similarity (stashed in each candidate's
-                  // `score` above) so more semantically-similar posts rank higher.
-                  { name: 'candidate_score', weight: RANK_SIM_WEIGHT },
-                ],
-                user_did: userDid || 'did:plc:z72i7hdynmk6r22z27h6tvur'
-              }),
-              signal: AbortSignal.timeout(rankMs),
-            });
-            if (!rankRes.ok) errs.push(`ge-rank:http-${rankRes.status}`);
-            if (rankRes.ok) {
-                const rankData = await rankRes.json();
-                if (rankData.rankings && rankData.rankings.length > 0) {
-                    const rankedUris = rankData.rankings.map((r: any) => r.at_uri);
-                    filteredCandidates.sort((a, b) => {
-                        const idxA = rankedUris.indexOf(a.uri);
-                        const idxB = rankedUris.indexOf(b.uri);
-                        return (idxA === -1 ? 9999 : idxA) - (idxB === -1 ? 9999 : idxB);
-                    });
-                    reranked = true;
-                } else {
-                    errs.push('ge-rank:empty');
-                }
-            }
-          } catch (e: any) {
-              console.error("[getFeedSkeleton] GE rank failed:", e?.message || String(e));
-              errs.push(stageErr('ge-rank', e));
-          }
-
-          if (!reranked) orderByGeneratorScore(filteredCandidates, errs);
-
-          // NOTE: the GE /diversify step was removed. It re-sorts candidates by
-          // the generator's popularity `score` and ignores the input order, so
-          // it silently overwrote the rank order above (the reranker had no
-          // visible effect). It also expects minilm embeddings, which this feed
-          // doesn't produce (we embed with Jina), so it couldn't diversify
-          // anyway. Rank order is now the final feed order.
-          tRank = Date.now() - tR_start;
         }
+        tRank = Date.now() - tR_start;
       }
 
-      // The rerank (or the fallback ordering) has just sorted on engagement and
-      // score, which threads the English back through the list. Re-apply the
-      // partition last so the frozen list — and therefore page 1, which is the
-      // only page most readers see — leads with what this reader can be shown.
-      // Stable, so the order the ranker chose survives inside each group. Above
-      // tStore, which times the session write and should not absorb this.
+      // The final order has just sorted on engagement and score, which threads
+      // the English back through the list. Re-apply the partition last so the
+      // frozen list — and therefore page 1, which is the only page most readers
+      // see — leads with what this reader can be shown. Stable, so the order
+      // chosen above survives inside each group.
       if (deReader) germanFirst(filteredCandidates);
 
       const tSt_start = Date.now();
@@ -1542,7 +1380,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
       // (4b) Nothing to serve. Every stage above has a failure path that ends here
       // with an empty list: GE timed out, GE answered with an empty pool, the text
-      // gates dropped everything, the rank returned no order. Each was written as
+      // gates dropped everything, Jina scored nothing usable. Each was written as
       // "serve what we have", and what we have at this point is an empty skeleton.
       if (rankedUris.length === 0) {
         const staleRes = await serveStale('fallback:empty', {
@@ -1552,24 +1390,24 @@ async function handleRequest(request: Request): Promise<Response> {
         if (staleRes) return staleRes;
       }
 
-      let sessionStored = false;
+      // Freeze the list after the response, not before it. The write used to be
+      // awaited, and 450ms of every request was held back for it, which is budget
+      // the paid stage now gets. The cost is that the cursor goes out before the
+      // row exists. That is safe in
+      // practice: the next page is only requested once the reader has scrolled
+      // through this one, while the write takes ~30ms. If it does fail, the cursor
+      // misses at (2) and falls through to a fresh page, the same path an expired
+      // session already takes, with seen-exclusion covering what was shown. A
+      // failed write is therefore only visible in the console log, not in
+      // feed_logs, since that row is written before the write settles.
       let sessionId = '';
       if (rankedUris.length > 0) {
         sessionId = crypto.randomUUID();
-        // A write that misses its slice yields no cursor -- the client gets page 1
-        // and a refresh regenerates -- which is already what a failed write does.
-        sessionStored = await withDeadline(
-          putFeedSession(sessionId, userDid, rankedUris),
-          // The floor is what SESSION_WRITE_RESERVE_MS was held back for. Every
-          // stage above sliced around it, so it is time this request already
-          // declined to spend elsewhere rather than an overrun.
-          Math.max(budget.slice(DB_STAGE_TIMEOUT_MS), SESSION_WRITE_RESERVE_MS),
-          'session-write')
-          .catch((e: any) => {
-            console.error("[getFeedSkeleton] session write failed:", errChain(e));
-            errs.push(stageErr('session-write', e));
-            return false;
-          });
+        runAfterResponse(
+          putFeedSession(sessionId, userDid, rankedUris)
+            .then(ok => { if (!ok) console.error("[getFeedSkeleton] session write reported failure"); })
+            .catch((e: any) => console.error("[getFeedSkeleton] session write failed:", errChain(e)))
+        );
       }
 
       // Opportunistically prune expired sessions so the table stays bounded.
@@ -1585,62 +1423,12 @@ async function handleRequest(request: Request): Promise<Response> {
       const page = rankedUris.slice(0, limit);
       const feed: { post: string }[] = page.map(uri => ({ post: uri }));
 
-      // Emit a continuation cursor only when the session was stored AND more
-      // posts remain past this page; omitting it signals "end of feed". A failed
-      // session write yields no cursor — the client gets page 1 and a refresh
-      // regenerates, rather than a cursor that could only miss and regenerate.
+      // Emit a continuation cursor whenever more posts remain past this page;
+      // omitting it signals "end of feed". The session behind it is written after
+      // the response (see above).
       const body: SkeletonBody = { feed };
-      if (sessionStored && limit < rankedUris.length) {
+      if (sessionId && limit < rankedUris.length) {
         body.cursor = encodeCursor(sessionId, limit);
-      }
-
-      // Only cache the public/unauthenticated feed. Personalized (logged-in)
-      // feeds are never cached: caching them lagged interactionSeen exclusion by
-      // up to SKELETON_TTL_SEC (the cached page kept re-serving already-seen
-      // posts). Recomputing every personalized request keeps exclusion immediate;
-      // the public feed still caches since it has no per-user state to stale.
-      if (!userDid) {
-        const resToCache = new Response(JSON.stringify(body), {
-          headers: {
-            'Content-Type': 'application/json',
-            'Cache-Control': `s-maxage=${SKELETON_TTL_SEC}`,
-            // Markers so a later cache HIT isn't blind: whether this cached body
-            // was personalized, and how it was produced.
-            'X-Personalized': String(personalized),
-            'X-Feed-Path': feedPath,
-            'X-Cand-Count': String(candidates.length),
-            // Total that passed the vector filter (the full frozen list), not the
-            // page length — preserves this marker's meaning now that we page.
-            'X-Pass-Count': String(rankedUris.length),
-          }
-        });
-        await safeCachePut(cache, skeletonCacheKeyStr, resToCache);
-
-        // Keep this list as the public fallback for (4b). The whole ranked list,
-        // not this page, so a later failing request can slice it to whatever
-        // `limit` it was asked for. Its TTL is SESSION_TTL_MS, matching the window
-        // the signed-in fallback reaches back over, so both halves of (4b) go
-        // stale at the same age. X-Stored-At carries the age, because a Cache API
-        // hit tells us the entry is still fresh but not how old it is.
-        //
-        // Guarded on a non-empty list and deferred past the response. Non-empty
-        // because an empty fallback is not a fallback, and writing one here would
-        // replace a usable list with a useless one on exactly the bad request that
-        // needs it. Deferred because RESPONSE_RESERVE_MS is sized for one cache
-        // put, and this is the second -- it must not come out of the reader's
-        // latency to buy insurance for a later reader.
-        if (rankedUris.length > 0) {
-          runAfterResponse(safeCachePut(cache, lastGoodCacheKeyStr, new Response(
-            JSON.stringify({ feed: rankedUris.map(uri => ({ post: uri })) } satisfies SkeletonBody),
-            {
-              headers: {
-                'Content-Type': 'application/json',
-                'Cache-Control': `s-maxage=${Math.floor(SESSION_TTL_MS / 1000)}`,
-                'X-Stored-At': String(Date.now()),
-              },
-            },
-          )));
-        }
       }
 
       logFeed({
@@ -1664,16 +1452,15 @@ async function handleRequest(request: Request): Promise<Response> {
           'Content-Type': 'application/json',
           'X-Cache': 'miss',
           'X-Page-Path': 'fresh',
-          // Never let the Bunny PullZone CDN cache the personalized skeleton (see
-          // the hit path above): its cache key ignores the cursor and the per-user
-          // Authorization/DID, so a single cached copy freezes the feed and defeats
-          // seen-post exclusion. Our own caches.default already caches per-key.
+          // Never let the Bunny PullZone CDN cache the skeleton: its cache key
+          // ignores the cursor and the per-user Authorization/DID, so a single
+          // cached copy freezes the feed and defeats seen-post exclusion.
           'Cache-Control': 'no-store',
           // Diagnostics (readable off the HTTP response, no logs needed):
           // X-Feed-Version confirms which build is actually serving traffic;
           // X-Ranked-Count is the full frozen list length; X-Exclude-Count reports
           // how many seen-post URIs were sent to GE as exclude_uris this request.
-          'X-Feed-Version': 'minilm-prefilter-1',
+          'X-Feed-Version': 'minilm-prefilter-2',
           // What the reader's client told us it will display, and whether that
           // moved their language to the front of the list.
           'X-Reader-Lang': `${rLangs.join(',') || 'none'}${deReader ? ' de-first' : ''}`,
@@ -1715,15 +1502,7 @@ async function handleRequest(request: Request): Promise<Response> {
 
   if (url.pathname === '/xrpc/app.bsky.feed.sendInteractions' && request.method === 'POST') {
     try {
-      // Extract User DID from ATProto Service JWT
-      const authHeader = request.headers.get('Authorization');
-      let userDid = null;
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        try {
-          const decoded: any = jwtDecode(authHeader.substring(7));
-          userDid = decoded.iss; // Service JWT issuer is the user's DID
-        } catch (e) { }
-      }
+      const userDid = didFromAuth(request);
 
       const body = await request.json();
       if (body.interactions && Array.isArray(body.interactions)) {
@@ -1743,6 +1522,28 @@ async function handleRequest(request: Request): Promise<Response> {
     } catch (e: any) {
       console.error("[sendInteractions] error:", e?.message, e?.stack);
       return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+  }
+
+  // --- PRESCORE JOB ---
+  // Called by an external cron (.github/workflows/prescore.yml), since Bunny has
+  // no scheduler. See prescore.ts. Disabled unless PRESCORE_TOKEN is set, and
+  // answers 404 to anything without it, so the route is not advertised.
+  if (url.pathname === '/_jobs/prescore' && request.method === 'POST') {
+    const token = getEnv('PRESCORE_TOKEN');
+    if (!token || request.headers.get('Authorization') !== `Bearer ${token}`) {
+      return new Response('Not found', { status: 404 });
+    }
+    const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' };
+    try {
+      const t0 = Date.now();
+      const report = await runPrescore();
+      console.log('[prescore] ' + JSON.stringify({ ...report, ms: Date.now() - t0 }));
+      return new Response(JSON.stringify({ ...report, ms: Date.now() - t0 }), { headers });
+    } catch (e: any) {
+      console.error('[prescore] failed:', errChain(e));
+      const status = e instanceof PrescoreConfigError ? 409 : 500;
+      return new Response(JSON.stringify({ error: errChain(e) }), { status, headers });
     }
   }
 

@@ -1,0 +1,49 @@
+name: Prescore feed posts
+
+# Bunny Edge Scripting has no scheduler, so this is the cron for
+# bunny_feed/src/prescore.ts: it POSTs /_jobs/prescore, which scores the source
+# feed's newest posts into the live feed's post_scores cache.
+#
+# One call is one Edge Script request, capped at 50 subrequests, so a call scores
+# at most ~41 posts. The source feed peaks at ~200 eligible posts an hour (~17 per
+# 5 minutes), so one call per run keeps up; GitHub often starts scheduled runs late
+# or skips them under load, so the run keeps calling while the job reports
+# `remaining` > 0, each call with its own fresh subrequest budget.
+#
+# Needs two repository secrets:
+#   PRESCORE_URL    the worker's base URL, e.g. https://feedforward.b-cdn.net
+#   PRESCORE_TOKEN  the same value as PRESCORE_TOKEN in the Bunny script's env
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# A late run must not overlap the next one: both would read the same missing
+# posts before either wrote, and buy them twice.
+concurrency:
+  group: prescore
+  cancel-in-progress: false
+
+jobs:
+  prescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Call the prescore job
+        env:
+          PRESCORE_URL: ${{ secrets.PRESCORE_URL }}
+          PRESCORE_TOKEN: ${{ secrets.PRESCORE_TOKEN }}
+        run: |
+          set -euo pipefail
+          for call in 1 2 3 4; do
+            body=$(curl -sS --fail-with-body --max-time 60 -X POST \
+              -H "Authorization: Bearer $PRESCORE_TOKEN" \
+              "$PRESCORE_URL/_jobs/prescore")
+            echo "call $call: $body"
+            remaining=$(echo "$body" | jq -r '.remaining')
+            pushed=$(echo "$body" | jq -r '.pushed')
+            # Done when nothing is left, or when a call made no progress (every
+            # TypeSafe call failing): calling again would just fail again.
+            if [ "$remaining" = "0" ] || [ "$pushed" = "0" ]; then break; fi
+          done

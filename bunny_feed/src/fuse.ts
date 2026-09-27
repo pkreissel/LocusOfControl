@@ -59,7 +59,7 @@ export function fuseByRank(cands: Fusable[]): void {
     const m = cands[i].minilmScore == null ? rJina[i] : rMini[i];
     const j = cands[i].jinaScore == null ? rMini[i] : rJina[i];
     // Best rank 0 -> score 1, worst -> ~0, so `score` stays "higher is better" for
-    // the sort below and for GE's candidate_score model.
+    // the sort that follows in index.ts.
     cands[i].score = 1 - ((m + j) / 2) / n;
   }
 }

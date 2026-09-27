@@ -74,6 +74,11 @@ gitignored like the rest of `training/data/`, and rebuildable from the score
 files with `--rebuild-ledger`. Before the ledger existed the same 500 gold posts
 had been bought four times over.
 
+The edge prescore job (`bunny_feed/src/prescore.ts`) buys TypeSafe answers too,
+and records them in the live DB's `typesafe_answers`, which the local ledger
+cannot see. `bunny_feed/sync_typesafe_ledger.ts` appends them to the ledger;
+run it before any offline scoring of live posts.
+
 **Judge this axis on AP and P@25, not AUC.** The feed consumes the top of a
 ranking and never sees the tail. The two metrics have already disagreed in sign
 on a real retrain.
@@ -94,5 +99,9 @@ fill a MiniLM cache with 1024-dim Jina vectors.
 
 Push to `main` touching `bunny_feed/**`. That is the deploy — `.github/workflows/deploy.yml`
 migrates the DB and ships the bundle. There is no separate step and no staging,
-so a vector export and its threshold recalibration belong in the same commit.
+so a vector export and its threshold recalibration belong in the same commit. So do the prescore
+calibration (`training/export_prescore_assets.py`, fitted on a pool scored by
+the new vector) and a cache rewarm (`bunny_feed/rewarm_cache.ts --commit`, run
+before the push); without them the retrain deploys onto a cold cache and the
+prescore job refuses to run.
 `bunny_feed/src/vector.prev.json` is the local rollback copy.

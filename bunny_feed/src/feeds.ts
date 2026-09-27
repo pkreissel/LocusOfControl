@@ -1,5 +1,6 @@
 import { createScorer, type Scorer, type VectorData } from './vector';
 import { looksGerman } from './lang';
+import { EMBEDDING_MODEL } from './jina';
 import locVectorData from './vector.json';
 import locMinilmVectorData from './vector_minilm.json';
 
@@ -19,6 +20,8 @@ import locMinilmVectorData from './vector_minilm.json';
 // Nor is one portable between candidate *pools*. A threshold set as a percentile
 // describes the pool it was measured on, and this deployment draws two: GE's
 // `popularity` mix for anonymous requests and `followed_users` for signed-in ones.
+// (The anonymous path has since been removed: only signed-in readers are served.
+// The measurements below that mention it are kept as they were taken.)
 // The same 0.9356 was the 80th percentile of the first and the 87th of the second,
 // which quietly cut the signed-in feed to a third of its length (see the note on
 // LOC.prefilter). Prefer ranking to an absolute cut wherever a stage only has to
@@ -32,18 +35,12 @@ export type FeedConfig = {
   /** Scorer built from this feed's trained vector. */
   scorer: Scorer;
   /**
-   * Minimum calibrated probability a candidate must reach to survive into the
-   * reranker. Tuned as a keep-rate against 500 GE candidates, not as a
-   * precision target: the vector is a pre-filter and GE's ranker (blending the
-   * score via RANK_SIM_WEIGHT) decides the final order.
+   * Minimum calibrated probability a candidate must reach to be served. Tuned
+   * as a keep-rate against 500 GE candidates, not as a precision target: the
+   * vector selects the feed, and GE's own engagement score decides the order
+   * within it (orderByGeneratorScore in index.ts).
    */
   threshold: number;
-  /**
-   * Force the unauthenticated path, ignoring the caller's DID. Used by feeds
-   * that are meant to be identical for everyone, so one cached copy is correct
-   * to serve to all readers.
-   */
-  forcePublic?: boolean;
   /**
    * Number of parallel GE candidate calls. GE caps num_candidates at 1000 per
    * request, and the popularity/network_likes/two_tower mix is effectively
@@ -78,11 +75,12 @@ export type FeedConfig = {
    */
   minWords?: number;
   /**
-   * What decides the final order. 'ge' hands survivors to GE's reranker (the
-   * original behavior). 'score' orders by this feed's own vector score and
-   * skips the rerank call — correct when the vector *is* the editorial
-   * criterion, since GE's ranker optimizes engagement and reorders almost
-   * independently of it (measured Spearman 0.277 against the assist score).
+   * What decides the final order among the selected posts. 'ge' (the default)
+   * orders by each generator's own engagement score, rank-normalised per
+   * generator. 'score' keeps this feed's own (fused) vector order -- correct when
+   * the vector *is* the editorial criterion, since engagement reorders almost
+   * independently of it (measured Spearman 0.277 against the assist score, when
+   * GE's remote reranker still did this job).
    */
   rankBy?: 'ge' | 'score';
   /**
@@ -224,10 +222,10 @@ export function bypassBudget(
 // *nothing* — measured over 17.5k dataset texts and 993 live two-tower
 // candidates alike. 0.88 restores the "passes ~50%" intent: it keeps 47% of
 // corpus texts and 34% of live candidates (~172 of 500, still clear of
-// MAX_RERANK_CANDIDATES), and on the held-out validation set keeps 76% of
+// MAX_FEED_LENGTH), and on the held-out validation set keeps 76% of
 // internal posts against 26% of external ones. Going to 0.90 sharpens that to
 // 54%/12% but leaves only ~104 live candidates, which would starve the
-// reranker — raise num_candidates first if you want that operating point.
+// feed — raise num_candidates first if you want that operating point.
 const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   scorer: createScorer(locVectorData as VectorData),
   threshold: 0.86,
@@ -235,7 +233,7 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // for that claim to be readable at all. Measured against a live 500-candidate
   // pool: 6 words cuts the pool to 396 (23 of the drops had *empty* text, which
   // was being embedded and scored) and the survivors still clear the 0.88 gate
-  // 265 deep -- far above MAX_RERANK_CANDIDATES, so the reranker is not starved.
+  // 265 deep -- far above MAX_FEED_LENGTH, so the feed is not starved.
   // Going to 8 buys little (245 through) and starts cutting real one-liners.
   minWords: 6,
   // Back to 500 from GE's 1000 ceiling, and this is a quality concession made to
@@ -291,7 +289,7 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // that gate is what says so; X-Prefilter reports the shortlist's floor
   // probability (p=) on every response so the operating point stays observable.
   //
-  // 150 was chosen against MAX_RERANK_CANDIDATES when that cap was 100, with room
+  // 150 was chosen against MAX_FEED_LENGTH when that cap was 100, with room
   // for Jina chunk failures. The cap is now 150 as well, so this stage no longer
   // over-provisions against it: the English side alone fills the feed only if
   // nothing fails, and the bypassed German candidates supply the rest of the
@@ -363,6 +361,16 @@ export const DEFAULT_FEED = FEEDS['feed-forward'];
 
 export function resolveFeed(rkey: string): FeedConfig {
   return FEEDS[rkey] ?? DEFAULT_FEED;
+}
+
+// The version half of the score cache's (uri, version) key. Scopes a row to the
+// embedding model AND the scoring vector, so retraining either invalidates old
+// rows by simple cache miss, and keeps two feeds' scores for the same post
+// apart. Shared by the feed request, the prescore job and push_score_cache.ts'
+// format: a key derived independently anywhere could drift from the one the
+// feed reads.
+export function scoreCacheVersion(scorer: { version: string }): string {
+  return `${EMBEDDING_MODEL}:${scorer.version}`;
 }
 
 // Every distinct scoring vector in the registry, de-duplicated by fingerprint.

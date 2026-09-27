@@ -1,5 +1,5 @@
 import { drizzle } from 'drizzle-orm/sqlite-proxy';
-import { embeddingUsage, feedInteractions, feedLogs, feedSessions, postScores } from './schema';
+import { embeddingUsage, feedInteractions, feedLogs, feedSessions, postScores, typesafeAnswers } from './schema';
 import { sql, and, eq, lt, gte, inArray, desc, isNotNull } from 'drizzle-orm';
 
 declare const process: any;
@@ -495,4 +495,34 @@ export async function pruneOldFeedLogs(cutoffTs: number): Promise<void> {
     .where(lt(feedLogs.ts, cutoffTs))
     .limit(1000);
   await db.delete(feedLogs).where(inArray(feedLogs.id, toDelete));
+}
+
+// --- TypeSafe answers (prescore job) -------------------------------------------
+//
+// See typesafeAnswers in schema.ts. Both calls are single statements: the job
+// runs under a 50-subrequest cap and budgets them one each (prescore.ts).
+
+export type TypesafeAnswerRow = typeof typesafeAnswers.$inferInsert;
+
+// The stored answer JSON for each of `uris` already bought. <= 200 uris, one
+// statement; the job never asks for more.
+export async function getTypesafeAnswers(uris: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (uris.length === 0) return out;
+  const db = getDbClient();
+  const rows = await db.select({ uri: typesafeAnswers.uri, answer: typesafeAnswers.answer })
+    .from(typesafeAnswers)
+    .where(inArray(typesafeAnswers.uri, uris));
+  for (const r of rows as { uri: string; answer: string }[]) out.set(r.uri, r.answer);
+  return out;
+}
+
+// Record answers the moment they are paid for. Insert-or-ignore: an answer is
+// never replaced, since the first one is the one that was billed. 10 columns, so
+// at most ~99 rows per statement under SQLite's 999 bound parameters; the job
+// writes <= 40.
+export async function putTypesafeAnswers(rows: TypesafeAnswerRow[]): Promise<void> {
+  if (rows.length === 0) return;
+  const db = getDbClient();
+  await db.insert(typesafeAnswers).values(rows).onConflictDoNothing();
 }

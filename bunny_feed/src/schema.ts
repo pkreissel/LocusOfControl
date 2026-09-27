@@ -169,3 +169,39 @@ export const feedLogs = sqliteTable('feed_logs', {
   // append to the index edge.
   index('feed_logs_ts_idx').on(t.ts),
 ]);
+
+// Every TypeSafe answer the prescore job (src/prescore.ts) has paid for, in full.
+//
+// post_scores only holds the calibrated scalar, under one vector's version, for
+// four days. That is enough to serve the feed and nothing else: it cannot say
+// which rows came from the teacher, it loses the class probabilities and Score
+// the trainer's band target is built from, and a retrain makes every row
+// unreachable. This table keeps what was bought:
+//
+//   - the job checks it before buying, so a post whose post_scores row is gone
+//     (pruned, a failed write, a new vector version) is re-mapped, not re-bought;
+//   - rewarm_cache.ts re-maps these answers onto a retrained vector's scale, so a
+//     retrain does not throw the teacher's scores away;
+//   - sync_typesafe_ledger.ts appends them to training/data/typesafe_ledger.jsonl
+//     and writes their texts as a corpus, so live posts can be distilled from and
+//     the offline pipeline never buys them again;
+//   - vector_prob, the deployed vector's own score for the same text, makes
+//     "where does the vector disagree with its teacher" a query.
+//
+// The text is stored because a post can be deleted before anyone trains on it.
+// Never pruned: it is the record of spend.
+export const typesafeAnswers = sqliteTable('typesafe_answers', {
+  uri: text('uri').primaryKey(),
+  text: text('text').notNull(),
+  textKey: text('text_key').notNull(),           // score_loc_typesafe.text_key(): sha256 of
+                                                 //   whitespace-normalised text, 16 hex
+  tag: text('tag').notNull(),                    // source feed
+  model: text('model').notNull(),                // TypeSafe model that answered
+  answer: text('answer').notNull(),              // JSON, the local ledger row's answer fields
+  vectorProb: real('vector_prob'),               // deployed vector on the same text (null: Jina failed)
+  vectorVersion: text('vector_version').notNull(),
+  postCreatedAt: integer('post_created_at'),     // unix ms, from the record
+  createdAt: integer('created_at').notNull(),    // unix ms, when it was bought
+}, (t) => [
+  index('typesafe_answers_created_at_idx').on(t.createdAt),
+]);
