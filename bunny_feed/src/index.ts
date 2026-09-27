@@ -327,7 +327,15 @@ function toFeedLogRow(f: Record<string, unknown>): FeedLogRow {
 // feeds.ts). The GE call itself measures 1.2-1.9s there; the rest of t_cand is
 // this worker decoding the payload, which halves with it. 2.5s covers the call
 // with room for the decode, and the budget takes back anything it cannot pay.
-const GE_GENERATE_TIMEOUT_MS = 2500;
+//
+// 2.5s was not enough from the edge. Over the week to 2026-09-27, 89 of 318
+// fresh requests (28%) hit it and served an empty pool, while the same call made
+// from outside Bunny, with a real 1000-URI exclude list, took 1.2-1.5s -- so the
+// slow tail is on the edge-to-GE path, not in GE. Raised to 3.2s now that the
+// rerank and the session-write reserve no longer need that time: a generate that
+// uses all of it leaves ~500ms, below JINA_MIN_MS, so the request skips Jina and
+// finishes on cached and MiniLM scores -- a worse-ranked feed instead of none.
+const GE_GENERATE_TIMEOUT_MS = 3200;
 
 // A generate that fails *early* leaves budget on the table, and the failures that
 // actually show up here -- a dropped connection, a 502 from a rolling deploy, a
@@ -343,8 +351,8 @@ const GE_GENERATE_TIMEOUT_MS = 2500;
 // now ask for (1.4-2.2s hydrated at 500 candidates): a retry either gets a window
 // a generate has actually been observed to finish in, or it does not run at all --
 // a retry that is going to be aborted at the deadline only delays the empty pool
-// the reader is already getting. Inside a 2.5s stage that makes "early" mean
-// "failed within ~300ms", which is what the failures worth retrying look like: a
+// the reader is already getting. Inside a 3.2s stage that makes "early" mean
+// "failed within ~1s", which covers the failures worth retrying: a
 // refused connection or an instant 502 lands in tens of milliseconds. A timeout is
 // by construction not early -- it consumed the whole budget -- so it is never
 // retried.
