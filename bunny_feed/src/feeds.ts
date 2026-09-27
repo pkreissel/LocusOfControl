@@ -327,6 +327,21 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
   // budget is 86% of the way to what the paid ranker could do with it. Raising it
   // is the only lever that moves German recall materially (100 slots -> 72%,
   // 160 -> 100%), and it is a straight Jina-token trade.
+  //
+  // The MiniLM vector is the union retrain (2026-09-21): the 5.5k jev corpus plus
+  // net20k labelled by the fine-tuned decider-2b. Swapped in alone on 2026-09-27,
+  // Jina vector unchanged, so the 0.86 gate, the score cache and the prescore
+  // calibration all still describe the vector they were measured on (this stage
+  // ranks and has no threshold of its own). Paired bootstrap against the previous
+  // MiniLM vector, Gemini labels:
+  //
+  //                   MiniLM alone              fused with deployed Jina
+  //   gold EN (500)   AP -0.004 p=0.81          AP +0.014 p=0.39
+  //   gold DE (420)   AP +0.065 p=0.005         AP +0.050 p=0.033, ext@25 -0.10
+  //
+  // German matters here although German candidates bypass this stage: the bypass
+  // budget is filled in this scorer's order, and it binds (80 of 130 German
+  // candidates cut on one live request the same day).
   prefilter: {
     scorer: createScorer(locMinilmVectorData as VectorData),
     shortlist: 150,
