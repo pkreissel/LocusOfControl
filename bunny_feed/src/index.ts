@@ -528,7 +528,21 @@ const SCORE_PRUNE_PROBABILITY = 0.02;
 // than SEEN_RETENTION_DAYS — we never go back further than the retention window.
 // That same window governs the opportunistic prune of "shown" rows (engaged
 // rows are kept for training), so read scope and stored data stay in lockstep.
-const SEEN_EXCLUDE_LIMIT = 1000;
+//
+// The limit counts distinct posts. It used to count rows, and a post shown twice
+// is two rows: 1000 rows was ~830 posts against the ~1200 a daily reader sees in
+// a week, so a third of what they had seen could never be excluded.
+const SEEN_EXCLUDE_LIMIT = 2000;
+// How long GE generate waits for the seen list before starting without it. A
+// warm read is ~45ms; a cold one on the edge has been observed past 600ms, and a
+// generate that waited for it had to be sent with no exclusion at all -- every
+// such list came back 50-75% posts the reader had already seen. Now a slow read
+// no longer holds up GE: it finishes alongside the generate (SEEN_READ_TIMEOUT_MS,
+// which costs no latency since generate takes longer) and the seen posts are
+// dropped from the pool in the worker instead. The only thing lost that way is
+// GE backfilling the pool with unseen posts.
+const SEEN_WAIT_MS = 300;
+const SEEN_READ_TIMEOUT_MS = 2000;
 const SEEN_RETENTION_DAYS = 7;
 const SEEN_PRUNE_PROBABILITY = 0.02;
 
@@ -857,7 +871,7 @@ async function handleRequest(request: Request): Promise<Response> {
       // its seen read is started lazily below, on the rare fall-through.
       const readSeen = (did: string) => withDeadline(
         getSeenUris(did, SEEN_EXCLUDE_LIMIT, SEEN_RETENTION_DAYS),
-        budget.slice(DB_STAGE_TIMEOUT_MS), 'seen-uris');
+        budget.slice(SEEN_READ_TIMEOUT_MS), 'seen-uris');
       const seenEarly: Promise<string[]> | null = !startCursor ? readSeen(userDid) : null;
       // Subscribed now, because nothing awaits it until (2b) has finished: a
       // rejection landing in between would otherwise be unhandled at the isolate
@@ -921,14 +935,24 @@ async function handleRequest(request: Request): Promise<Response> {
       // already finished behind the (2b) read, and then this is ~0.
       let tS_start = Date.now();
       let excludeUris: string[] = [];
-      {
-        excludeUris = await (seenEarly ?? readSeen(userDid))
-          .catch((e: any) => {
-            console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e));
-            errs.push(stageErr('seen-uris', e));
-            return [];
-          });
-      }
+      const seenP: Promise<string[] | null> = (seenEarly ?? readSeen(userDid))
+        .catch((e: any) => {
+          console.error("[getFeedSkeleton] seen-uris read failed:", errChain(e));
+          errs.push(stageErr('seen-uris', e));
+          return null;
+        });
+      // Ready within SEEN_WAIT_MS: GE gets it as exclude_uris and backfills the
+      // pool with unseen posts. Not ready: GE starts without it, and the read is
+      // collected after the gather and applied as a filter (see SEEN_WAIT_MS).
+      let seenTimer: any;
+      const seenQuick = await Promise.race([
+        seenP,
+        new Promise<'late'>(resolve => { seenTimer = setTimeout(() => resolve('late'), SEEN_WAIT_MS); }),
+      ]);
+      clearTimeout(seenTimer);
+      const seenLate: Promise<string[] | null> | null = seenQuick === 'late' ? seenP : null;
+      if (seenQuick !== 'late') excludeUris = seenQuick ?? [];
+      let seenFiltered = 0;
       tSeen = Date.now() - tS_start;
 
       // Opportunistically age out old "shown" rows so the table stays bounded
@@ -1146,6 +1170,22 @@ async function handleRequest(request: Request): Promise<Response> {
       tCand = Date.now() - tC_start;
       
       const gatherMs = Date.now() - tG;
+
+      // (3x) The seen list that missed SEEN_WAIT_MS. It has been loading alongside
+      // the generate, under its own SEEN_READ_TIMEOUT_MS, so this is normally
+      // already settled. Apply it as a filter: the posts GE would have excluded
+      // are dropped here instead, and the pool is that much smaller.
+      if (seenLate) {
+        const late = await seenLate;
+        errs.push(late ? 'seen:late' : 'seen:none');
+        if (late && late.length) {
+          const seen = new Set(late);
+          const before = candidates.length;
+          candidates = candidates.filter(c => !seen.has(c.uri));
+          seenFiltered = before - candidates.length;
+          excludeUris = late;
+        }
+      }
 
       // (3y) Score-cache read, started the moment the pool is known rather than
       // after the prefilter has picked the paid pool. It covers the whole pool
@@ -1453,7 +1493,7 @@ async function handleRequest(request: Request): Promise<Response> {
         cacheHit: embedHits, cacheMiss: embedMisses,
         jinaChunks: embedChunks, jinaFailed: embedFailedChunks,
         preHydrated, preKept, preFloor: preFloor.toFixed(4), preFellBack: preFellBack ? 'y' : 'n',
-        preBypass, preBypassDropped,
+        preBypass, preBypassDropped, seenFiltered,
         waitUntil: hasWaitUntil() ? 'y' : 'n',
         errors: errs.length ? errs.join(',') : null
       });

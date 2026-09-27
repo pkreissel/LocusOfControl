@@ -434,6 +434,9 @@ const SEEN_EVENT = 'app.bsky.feed.defs#interactionSeen';
 export async function getSeenUris(did: string, limit: number, withinDays: number): Promise<string[]> {
   if (!did) return [];
   const db = getDbClient();
+  // Distinct posts, most recently seen first: `limit` counts posts, not rows (a
+  // post shown twice is two rows). Still served by the covering
+  // (did, event, created_at, item) index; the grouping is over one reader's week.
   const rows = await db
     .select({ item: feedInteractions.item })
     .from(feedInteractions)
@@ -443,7 +446,8 @@ export async function getSeenUris(did: string, limit: number, withinDays: number
       isNotNull(feedInteractions.item),
       gte(feedInteractions.createdAt, sql`datetime('now', ${`-${withinDays} days`})`),
     ))
-    .orderBy(desc(feedInteractions.createdAt))
+    .groupBy(feedInteractions.item)
+    .orderBy(desc(sql`max(${feedInteractions.createdAt})`))
     .limit(limit);
   const out: string[] = [];
   for (const r of rows as { item: string | null }[]) if (r.item) out.push(r.item);
