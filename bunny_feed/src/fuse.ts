@@ -63,3 +63,28 @@ export function fuseByRank(cands: Fusable[]): void {
     cands[i].score = 1 - ((m + j) / 2) / n;
   }
 }
+
+/**
+ * The feed's final order: a weighted mean of each candidate's LoC rank and its
+ * engagement rank, written back as the order of `cands`.
+ *
+ * `geRank` is generatorRank()'s output (per-generator engagement rank, best 1,
+ * worst 0). The LoC side is `score` -- the fused rank score or the Jina
+ * probability, whichever this request produced -- converted to the same 0..1 rank
+ * scale within the list, so the weight means what it says whatever the score's
+ * own spread. `locWeight` 0 is the old pure-engagement order (LoC only breaking
+ * ties), 1 is the vector's own order.
+ *
+ * Ties on the blend fall back to `score`, so equal keys keep a meaningful order.
+ */
+export function blendLocAndEngagement(cands: Fusable[], geRank: number[], locWeight: number): void {
+  const n = cands.length;
+  if (n === 0) return;
+  const w = Math.min(1, Math.max(0, locWeight));
+  const byScore = cands.map((_, i) => i).sort((a, b) => (cands[b].score || 0) - (cands[a].score || 0));
+  const locRank = new Array<number>(n).fill(0.5);
+  if (n > 1) byScore.forEach((ci, pos) => { locRank[ci] = (n - 1 - pos) / (n - 1); });
+  const keyed = cands.map((c, i) => ({ c, k: w * locRank[i] + (1 - w) * geRank[i] }));
+  keyed.sort((a, b) => (b.k - a.k) || ((b.c.score || 0) - (a.c.score || 0)));
+  keyed.forEach((x, i) => { cands[i] = x.c; });
+}

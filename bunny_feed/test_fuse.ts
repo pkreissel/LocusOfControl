@@ -10,7 +10,7 @@
 // Routing German around the free stage and then burying it on the free stage's
 // ranking would have cancelled the whole change out.
 
-import { fuseByRank, type Fusable } from './src/fuse';
+import { fuseByRank, blendLocAndEngagement, type Fusable } from './src/fuse';
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = '') {
@@ -90,6 +90,23 @@ console.log('\nedge cases');
   const one = [{ id: 'solo', minilmScore: 0.5, jinaScore: 0.5, score: 0 }];
   fuseByRank(one);
   check('single candidate gets a finite score', Number.isFinite(one[0].score), String(one[0].score));
+}
+
+console.log('\nfinal order: LoC blended with engagement');
+{
+  // LoC order a > b > c; engagement order c > b > a.
+  const mk = () => [
+    { id: 'a', score: 0.99 }, { id: 'b', score: 0.90 }, { id: 'c', score: 0.87 },
+  ];
+  const ge = [0, 0.5, 1];
+  const at = (w: number) => { const c = mk(); blendLocAndEngagement(c, ge, w); return c.map(x => x.id).join(' > '); };
+  check('weight 0 is pure engagement', at(0) === 'c > b > a', at(0));
+  check('weight 1 is pure LoC', at(1) === 'a > b > c', at(1));
+  check('weight 0.65 lets LoC lead', at(0.65) === 'a > b > c', at(0.65));
+  check('weight 0.5 ties break on LoC score', at(0.5) === 'a > b > c', at(0.5));
+  const one = [{ id: 'solo', score: 0.9 }];
+  blendLocAndEngagement(one, [0.5], 0.65);
+  check('single candidate survives', one[0].id === 'solo');
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');

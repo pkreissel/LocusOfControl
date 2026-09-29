@@ -2,7 +2,7 @@ import { jwtDecode } from 'jwt-decode';
 import { getEmbeddingsBatched } from './jina';
 import { hasEnoughText } from './text';
 import { decodeEmbedding } from './minilm';
-import { fuseByRank } from './fuse';
+import { fuseByRank, blendLocAndEngagement } from './fuse';
 import { resolveFeed, ALL_SCORERS, bypassBudget, scoreCacheVersion, type FeedConfig } from './feeds';
 import { readerLangs, prefersGermanOnly, germanFirst } from './lang';
 import { recordEmbeddingUsage, recordInteractions, getSeenUris, pruneOldSeenInteractions, getCachedScores, putScores, pruneOldScores, putFeedSession, getFeedSession, getLatestFeedSession, pruneOldFeedSessions, recordFeedLog, pruneOldFeedLogs, type FeedLogRow } from './db';
@@ -188,18 +188,15 @@ function generatorRank(cands: Candidate[]): number[] {
 // at all, since sorting every candidate by the same null would shuffle a list that
 // at least means something. `errs` records only that fallback; ordering by GE
 // score is the normal case and is not an error.
-function orderByGeneratorScore(cands: Candidate[], errs: string[]): void {
+//
+// `locWeight` blends the LoC rank back in (see blendLocAndEngagement in fuse.ts):
+// at 0 engagement alone orders the list and the vector only breaks ties.
+function orderByGeneratorScore(cands: Candidate[], errs: string[], locWeight = 0): void {
   if (!cands.some(c => typeof c.geScore === 'number')) {
     errs.push('order:no-gescore');
     return;
   }
-  const pct = generatorRank(cands);
-
-  // Vector probability breaks ties, so candidates that land on the same normalised
-  // rank keep a meaningful order rather than a sort-stable accident.
-  const keyed = cands.map((c, i) => ({ c, p: pct[i] }));
-  keyed.sort((a, b) => (b.p - a.p) || ((b.c.score || 0) - (a.c.score || 0)));
-  keyed.forEach((k, i) => { cands[i] = k.c; });
+  blendLocAndEngagement(cands, generatorRank(cands), locWeight);
 }
 
 type SkeletonBody = { feed: { post: string }[]; cursor?: string };
@@ -1409,7 +1406,7 @@ async function handleRequest(request: Request): Promise<Response> {
         // own engagement score, which is what the rerank call was there to add.
         const tR_start = Date.now();
         if (filteredCandidates.length > 0 && feedConfig.rankBy !== 'score') {
-          orderByGeneratorScore(filteredCandidates, errs);
+          orderByGeneratorScore(filteredCandidates, errs, feedConfig.locWeight ?? 0);
         }
         tRank = Date.now() - tR_start;
       }

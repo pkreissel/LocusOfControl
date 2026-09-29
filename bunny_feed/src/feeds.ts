@@ -84,6 +84,14 @@ export type FeedConfig = {
    */
   rankBy?: 'ge' | 'score';
   /**
+   * With rankBy 'ge', how much the vector's own rank counts in the final order
+   * against the engagement rank: the key is `locWeight * locRank + (1 -
+   * locWeight) * engagementRank`, both on a 0..1 rank scale within the list.
+   * 0 (the default) is pure engagement with the vector only breaking ties; 1 is
+   * the same as rankBy 'score'. Ordering only -- selection is untouched.
+   */
+  locWeight?: number;
+  /**
    * Free first-pass ranking over Green Earth's hydrated MiniLM embeddings, so the
    * paid Jina stage only ever sees a shortlist.
    *
@@ -350,6 +358,10 @@ const LOC: Omit<FeedConfig, 'rkey' | 'name'> = {
     bypassFloor: 50,
   },
   fuse: true,
+  // The final order used to be engagement alone, with the LoC score only breaking
+  // ties, so the most agentic post in the list could sit anywhere on page 1. 0.65
+  // lets the axis lead while engagement still reorders posts of similar LoC rank.
+  locWeight: 0.65,
 };
 
 // Note: only feeds whose record points at did:web:feedforward.b-cdn.net reach

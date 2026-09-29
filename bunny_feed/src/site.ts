@@ -393,7 +393,7 @@ export function renderSite(): string {
   <div class="step"><b>2. Length gate</b><span>Anything under six words is dropped &mdash; too short to read a position off.</span></div>
   <div class="step"><b>3. Score</b><span>Each post is embedded and scored against one trained vector.</span></div>
   <div class="step gate"><b>4. Gate</b><span>Below ${STUDY.threshold}, a post is discarded. This is the only thing the vector decides.</span></div>
-  <div class="step"><b>5. Order</b><span>Survivors are ranked for relevance by a separate engagement model.</span></div>
+  <div class="step"><b>5. Order</b><span>Survivors are ordered mostly by their locus-of-control rank, blended with a separate engagement model.</span></div>
 </div>
 <p>Because step 4 is the vector's whole editorial act, every measurement below
 holds the length gate fixed and varies only the threshold: <b>${STUDY.pool.toLocaleString('en')}</b>
