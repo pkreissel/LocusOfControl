@@ -47,11 +47,41 @@ def has_enough_text(text, min_words=MIN_WORDS):
     return words >= min_words or chars >= min_words * 5
 
 
+BASE, AUTH = APPVIEW, None
+
+
+def login():
+    """LOC_AUTH=1: read the feed as the account in .env (BLUESKY_HANDLE,
+    BLUESKY_APP_PASSWORD, BSKY_PDS_URL), so personalised feeds answer the way they
+    do for a signed-in reader. Requests then go through the user's PDS, which
+    proxies app.bsky.* to the AppView with the session attached."""
+    global BASE, AUTH
+    from pathlib import Path
+    if os.environ.get("LOC_AUTH_JWT"):  # a caller that collects many feeds logs in once
+        AUTH, BASE = "Bearer " + os.environ["LOC_AUTH_JWT"], os.environ["LOC_AUTH_PDS"]
+        return
+    env = {}
+    for line in (Path(__file__).resolve().parents[2] / ".env").read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip("\"'")
+    pds = env.get("BSKY_PDS_URL", "https://bsky.social").rstrip("/")
+    req = urllib.request.Request(
+        f"{pds}/xrpc/com.atproto.server.createSession",
+        data=json.dumps({"identifier": env["BLUESKY_HANDLE"],
+                         "password": env["BLUESKY_APP_PASSWORD"]}).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        AUTH = "Bearer " + json.loads(r.read())["accessJwt"]
+    BASE = pds
+
+
 def get(path, params, tries=4):
-    url = f"{APPVIEW}/xrpc/{path}?" + urllib.parse.urlencode(params)
+    url = f"{BASE}/xrpc/{path}?" + urllib.parse.urlencode(params)
     for attempt in range(tries):
         try:
-            with urllib.request.urlopen(url, timeout=30) as r:
+            req = urllib.request.Request(url, headers={"Authorization": AUTH} if AUTH else {})
+            with urllib.request.urlopen(req, timeout=30) as r:
                 return json.loads(r.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
             if attempt + 1 == tries:
@@ -124,6 +154,8 @@ def main():
     if not args.feed:
         raise SystemExit("--feed (or LOC_FEED) is required")
 
+    if os.environ.get("LOC_AUTH") == "1":
+        login()
     feed_uri = resolve_feed_uri(args.feed)
     meta = get("app.bsky.feed.getFeedGenerator", {"feed": feed_uri}).get("view", {})
     print(f"Feed: {meta.get('displayName')!r} ({feed_uri})")
