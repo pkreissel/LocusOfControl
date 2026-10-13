@@ -100,8 +100,11 @@ def load_ledger():
     return by_uri, by_text
 
 
-def ask(text, attempts=5):
-    body = json.dumps({"state": text, "model": MODEL, "questions": QUESTIONS}).encode()
+def ask(text, attempts=5, questions=None):
+    # `questions` overrides the LoC set per call; a caller with several question
+    # sets passes them here rather than swapping the global from worker threads.
+    body = json.dumps({"state": text, "model": MODEL,
+                       "questions": questions or QUESTIONS}).encode()
     for i in range(attempts):
         req = urllib.request.Request(
             URL, data=body,
