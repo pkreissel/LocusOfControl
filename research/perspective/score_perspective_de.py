@@ -14,6 +14,12 @@ run alongside the collector and be re-invoked as the pool grows.
 
 Usage:
   python score_perspective_de.py [--follow] [--in FILE] [--out FILE]
+  python score_perspective_de.py --no-bridging --exclude INCOHERENT,LIKELY_TO_REJECT \
+      --in ../data/time_sample/time_sample_de.jsonl --out ../data/time_sample/perspective_de.jsonl
+
+--no-bridging drops the 7 bridging attributes (English-only); --exclude drops any
+others. INCOHERENT and LIKELY_TO_REJECT score "this is not English" on German
+text (memory/de-engagement-study-design.md), so a German-only run excludes them.
 """
 import argparse
 import json
@@ -131,7 +137,21 @@ def main():
                     help="keep polling the input for new rows (run alongside the collector)")
     ap.add_argument("--idle-exit", type=int, default=900,
                     help="in --follow mode, stop after this many seconds with no new rows")
+    ap.add_argument("--no-bridging", action="store_true",
+                    help="skip the 7 bridging attributes (English-only)")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated attributes to skip")
     args = ap.parse_args()
+
+    drop = {a.strip() for a in args.exclude.split(",") if a.strip()}
+    if args.no_bridging:
+        drop |= set(BRIDGING)
+    unknown = drop - set(CORE + EN_ONLY + BRIDGING)
+    if unknown:
+        print(f"unknown attributes in --exclude: {sorted(unknown)}", file=sys.stderr)
+        return 1
+    ATTRS[:] = [a for a in ATTRS if a not in drop]
+    print(f"{len(ATTRS)} attributes: {', '.join(ATTRS)}", flush=True)
 
     load_dotenv()
     key = os.environ.get("PERSPECTIVE_API_KEY")
